@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="dark">
   <meta name="theme-color" content="#1b1c1f">
   <meta name="description" content="EffectCraft: motion graphics and visual effects in the browser">
-  <title>EffectCraft</title>
+  <title>EffectCraft Pocket</title>
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
   <link rel="manifest" href="manifest.webmanifest">
   <link rel="apple-touch-icon" href="icon-256.png">
@@ -42,7 +42,7 @@
 </head>
 <body>
   <canvas id="effectcraft_canvas"></canvas>
-  <div id="loading"><img src="favicon.svg" alt=""><div id="status">Loading EffectCraft…</div><div id="substatus" style="font-size:12px;color:#8a8c99;">Initializing…</div></div>
+  <div id="loading"><img src="favicon.svg" alt=""><div id="status">Loading EffectCraft Pocket…</div><div id="substatus" style="font-size:12px;color:#8a8c99;">Initializing…</div></div>
   <script type="module">
     import init, * as ec from "./effectcraft_web.js";
     const t0 = performance.now();
@@ -129,14 +129,14 @@
       module = null;
       window.effectcraftLoad.wasmMs = performance.now() - t0;
 
-      setStatus("Starting EffectCraft UI & Canvas…");
+      setStatus("Starting EffectCraft Pocket UI & Canvas…");
       await ec.start("effectcraft_canvas");
       window.effectcraftLoad.readyMs = performance.now() - t0;
       if (window.AndroidBridge && window.AndroidBridge.onAppReady) {
         window.AndroidBridge.onAppReady();
       }
     } catch (e) {
-      console.error("EffectCraft start error:", e);
+      console.error("EffectCraft Pocket start error:", e);
       const errMsg = (e && (e.stack || e.message)) ? String(e.stack || e.message) : String(e);
       if (window.AndroidBridge && window.AndroidBridge.reportError) {
         window.AndroidBridge.reportError(String(e), errMsg);
@@ -145,7 +145,7 @@
       const sub = document.getElementById("substatus");
       if (s) {
         s.className = "err";
-        s.textContent = "EffectCraft could not start:\n" + errMsg;
+        s.textContent = "EffectCraft Pocket could not start:\n" + errMsg;
       }
       if (sub) {
         sub.innerHTML = "<div style='display:flex;gap:10px;margin-top:14px;'>" +

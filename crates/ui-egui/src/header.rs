@@ -26,8 +26,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let brand = Rect::from_min_size(pos2(x, cy - 12.0), vec2(24.0, 24.0));
     paint_logo(&p, brand);
     let bresp = ui.interact(brand, egui::Id::new("brand"), Sense::click());
-    app.auto.add("header.about", brand, "About EffectCraft");
-    if bresp.on_hover_text("About EffectCraft").clicked() {
+    app.auto.add("header.about", brand, "About EffectCraft Pocket");
+    if bresp.on_hover_text("About EffectCraft Pocket").clicked() {
         app.dialog = Some(Dialog::About);
     }
     x += 32.0;

@@ -237,7 +237,7 @@ pub async fn start(canvas_id: String) -> Result<(), JsValue> {
             .or_worse_values_from(&adapter_limits);
 
             eframe::wgpu::DeviceDescriptor {
-                label: Some("EffectCraft web device"),
+                label: Some("EffectCraft Pocket web device"),
                 required_limits,
                 ..Default::default()
             }

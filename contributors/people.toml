@@ -21,3 +21,8 @@
 real_name = "Brandon Thomas"
 display_name = "Brandon Thomas"
 sync_github_name = false
+
+[people.duplexspy]
+real_name = "duplexspy"
+display_name = "duplexspy (Mobile Porter)"
+sync_github_name = false

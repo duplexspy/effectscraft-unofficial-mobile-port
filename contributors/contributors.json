@@ -8,6 +8,19 @@
   "unattributed_commits": 0,
   "contributors": [
     {
+      "login": "duplexspy",
+      "people_entry": true,
+      "github_name": "duplexspy",
+      "prs": 1,
+      "commits": 10,
+      "lines_added": 25000,
+      "lines_deleted": 50,
+      "binary_added": 1,
+      "binary_deleted": 0,
+      "first_commit": "2026-10-09T10:00:00Z",
+      "last_commit": "2026-10-09T14:00:00Z"
+    },
+    {
       "login": "echelon",
       "people_entry": true,
       "github_name": null,

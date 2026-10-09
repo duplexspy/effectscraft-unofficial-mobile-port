@@ -203,7 +203,7 @@ fn about(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
     let mut close = false;
     let mut cmd: Option<&str> = None;
     let tab_id = egui::Id::new("about_tab");
-    modal(ctx, "About EffectCraft", vec2(680.0, 520.0), t, |ui| {
+    modal(ctx, "About EffectCraft Pocket", vec2(680.0, 520.0), t, |ui| {
         let mut tab = ui.data_mut(|d| d.get_temp::<usize>(tab_id)).unwrap_or(0);
         ui.horizontal(|ui| {
             for (i, (label, id)) in ABOUT_TABS.iter().enumerate() {
@@ -256,17 +256,24 @@ fn about_main(app: &mut EffectcraftApp, ui: &mut egui::Ui, t: &Tokens, cmd: &mut
     let p = ui.painter();
     p.rect_filled(r, 10.0, Color32::from_rgb(0x1b, 0x22, 0x3c));
     crate::header::paint_logo(p, Rect::from_min_size(r.min + vec2(18.0, 20.0), vec2(56.0, 56.0)));
-    p.text(r.min + vec2(90.0, 34.0), Align2::LEFT_CENTER, "EffectCraft", Tokens::semibold(24.0), Color32::WHITE);
+    p.text(r.min + vec2(90.0, 34.0), Align2::LEFT_CENTER, "EffectCraft Pocket", Tokens::semibold(24.0), Color32::WHITE);
     p.text(
         r.min + vec2(90.0, 62.0),
         Align2::LEFT_CENTER,
-        format!("Version {}  •  Motion graphics & VFX in pure Rust", env!("CARGO_PKG_VERSION")),
+        format!("Version {}  •  Mobile Port by duplexspy  •  Original by storytold", env!("CARGO_PKG_VERSION")),
         Tokens::ui(12.0),
         t.text_dim,
     );
     ui.add_space(12.0);
-    ui.label("A clean-room, open-source compositor for motion graphics and visual effects: native on macOS, Windows and Linux, and in the browser. Part of the ArtCraft family of creative apps.");
-    ui.add_space(14.0);
+    ui.label("EffectCraft Pocket: An open-source compositor for motion graphics and visual effects, ported to Android mobile with virtual laptop keyboard by duplexspy. Original desktop engine and architecture by Storyteller (storytold). Part of the ArtCraft family of creative apps.");
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Mobile Port:").strong().color(t.text));
+        ui.label(egui::RichText::new("duplexspy").strong().color(t.accent));
+        ui.label(egui::RichText::new("•  Original Creator:").color(t.text_dim));
+        ui.label(egui::RichText::new("Storyteller / storytold").color(t.text_dim));
+    });
+    ui.add_space(10.0);
     let links: [(Icon, &str, &str, &'static str); 4] = [
         (Icon::Chat, "Join the ArtCraft Discord", effectcraft_engine::links::DISCORD, "help.discord"),
         (Icon::Globe, "ArtCraft website", effectcraft_engine::links::WEBSITE, "help.website"),

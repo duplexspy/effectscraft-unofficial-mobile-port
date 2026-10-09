@@ -200,7 +200,7 @@
     kb.innerHTML = `
       <div class="ec-kb-header">
         <div class="ec-kb-header-left">
-          <span class="ec-kb-title">Laptop Keyboard</span>
+          <span class="ec-kb-title">Pocket Laptop Keyboard</span>
           <div class="ec-kb-quick-actions">
             <button class="ec-kb-action-btn" data-action="undo">Undo (Ctrl+Z)</button>
             <button class="ec-kb-action-btn" data-action="redo">Redo (Ctrl+Y)</button>

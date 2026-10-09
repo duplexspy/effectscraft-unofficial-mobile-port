@@ -622,8 +622,13 @@ export function browsePickFiles(directory) {
     const input = document.createElement("input");
     input.type = "file";
     input.multiple = true;
+    input.style.display = "none";
     if (directory) input.webkitdirectory = true;
-    input.oncancel = () => resolve([]);
+    document.body.appendChild(input);
+    input.oncancel = () => {
+      input.remove();
+      resolve([]);
+    };
     input.onchange = async () => {
       const out = [];
       for (const f of input.files) {
@@ -634,6 +639,7 @@ export function browsePickFiles(directory) {
           out.push({ path, error: String((e && (e.message || e.name)) || e) });
         }
       }
+      input.remove();
       resolve(out);
     };
     input.click();

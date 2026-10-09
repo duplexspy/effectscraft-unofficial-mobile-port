@@ -244,12 +244,23 @@ pub fn pick(accept: &str, multiple: bool, then: impl FnOnce(Vec<String>) + 'stat
     input.set_type("file");
     input.set_accept(accept);
     input.set_multiple(multiple);
+    input.set_attribute("style", "display:none")?;
+    if let Some(body) = doc.body() {
+        body.append_child(&input)?;
+    }
     let inp = input.clone();
+    let inp_remove = input.clone();
     let on_change = Closure::once_into_js(move || {
-        let Some(list) = inp.files() else { return };
+        let list = inp.files();
+        inp.remove();
+        let Some(list) = list else { return };
         read_files((0..list.length()).filter_map(|i| list.get(i)).collect(), then);
     });
+    let on_cancel = Closure::once_into_js(move || {
+        inp_remove.remove();
+    });
     input.add_event_listener_with_callback("change", on_change.unchecked_ref())?;
+    input.add_event_listener_with_callback("cancel", on_cancel.unchecked_ref())?;
     input.click();
     Ok(())
 }
