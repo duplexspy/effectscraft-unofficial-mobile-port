@@ -1,0 +1,16 @@
+*~
+plan/
+target/
+/dist
+/log
+.DS_Store
+.claude/worktrees/
+
+# Android build artifacts
+packaging/android/.gradle/
+packaging/android/build/
+packaging/android/app/build/
+packaging/android/local.properties
+.gradle/
+*.apk
+*.aab

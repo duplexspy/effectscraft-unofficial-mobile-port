@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/root_container"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/bg_dark">
+
+    <!-- The hardware-accelerated WebView hosting EffectCraft -->
+    <WebView
+        android:id="@+id/webview"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:focusable="true"
+        android:focusableInTouchMode="true" />
+
+    <!-- Floating Keyboard Button -->
+    <FrameLayout
+        android:id="@+id/btn_floating_keyboard"
+        android:layout_width="56dp"
+        android:layout_height="56dp"
+        android:layout_gravity="bottom|end"
+        android:layout_marginEnd="18dp"
+        android:layout_marginBottom="18dp"
+        android:background="@drawable/bg_floating_button"
+        android:clickable="true"
+        android:focusable="true"
+        android:elevation="8dp">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center"
+            android:text="⌨"
+            android:textColor="#ffffff"
+            android:textSize="28sp" />
+    </FrameLayout>
+
+</FrameLayout>

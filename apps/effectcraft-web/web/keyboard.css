@@ -1,0 +1,277 @@
+/* Virtual Laptop Keyboard Styles for EffectCraft Mobile / Android */
+
+:root {
+  --kb-bg: rgba(22, 23, 27, 0.95);
+  --kb-border: #383a42;
+  --kb-key-bg: #2b2d34;
+  --kb-key-bg-hover: #363942;
+  --kb-key-bg-active: #1f2025;
+  --kb-key-mod-active: #2d8ceb;
+  --kb-key-color: #e4e4e7;
+  --kb-key-sub-color: #8f929d;
+  --kb-key-border: #3d404b;
+  --kb-key-shadow: 0 2px 0 #18191d;
+  --kb-font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+}
+
+/* Floating Keyboard Button */
+#ec-floating-kb-btn {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  width: 54px;
+  height: 54px;
+  border-radius: 50%;
+  background: #2d8ceb;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(255, 255, 255, 0.15);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #ffffff;
+  cursor: pointer;
+  z-index: 99990;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
+  transition: transform 0.15s ease, background-color 0.2s ease, opacity 0.2s ease;
+}
+
+#ec-floating-kb-btn:active {
+  transform: scale(0.92);
+  background: #1a73e8;
+}
+
+#ec-floating-kb-btn svg {
+  width: 28px;
+  height: 28px;
+  fill: currentColor;
+  pointer-events: none;
+}
+
+/* Keyboard Overlay Container */
+#ec-keyboard-container {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 48vh;
+  min-height: 190px;
+  max-height: 52vh;
+  background: var(--kb-bg);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border-top: 1px solid var(--kb-border);
+  box-shadow: 0 -8px 24px rgba(0, 0, 0, 0.6);
+  z-index: 999999;
+  user-select: none;
+  -webkit-user-select: none;
+  font-family: var(--kb-font);
+  transition: transform 0.25s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.2s ease;
+  transform: translateY(0);
+  opacity: 1;
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+  padding: 4px 8px 8px 8px;
+}
+
+#ec-keyboard-container.ec-kb-hidden {
+  transform: translateY(105%);
+  opacity: 0;
+  pointer-events: none;
+}
+
+#ec-keyboard-container.ec-kb-transparent {
+  background: rgba(22, 23, 27, 0.65);
+}
+
+/* Header bar */
+.ec-kb-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 3px 6px 5px 6px;
+  font-size: 11px;
+  color: #9ea1ad;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  margin-bottom: 4px;
+}
+
+.ec-kb-header-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ec-kb-title {
+  font-weight: 600;
+  color: #cfd2dc;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  font-size: 10px;
+}
+
+.ec-kb-quick-actions {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.ec-kb-action-btn {
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  color: #c4c7d2;
+  border-radius: 3px;
+  padding: 2px 6px;
+  font-size: 10px;
+  cursor: pointer;
+  font-family: var(--kb-font);
+}
+
+.ec-kb-action-btn:active {
+  background: rgba(45, 140, 235, 0.4);
+  color: #ffffff;
+}
+
+.ec-kb-header-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ec-kb-tool-btn {
+  background: none;
+  border: none;
+  color: #9ea1ad;
+  font-size: 13px;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 3px;
+}
+
+.ec-kb-tool-btn:hover {
+  color: #ffffff;
+  background: rgba(255, 255, 255, 0.1);
+}
+
+/* Keyboard Main Sections (Main + Nav + Numpad) */
+.ec-kb-body {
+  display: flex;
+  gap: 6px;
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+}
+
+.ec-kb-section-main {
+  flex: 12;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.ec-kb-section-nav {
+  flex: 3;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.ec-kb-section-numpad {
+  flex: 4;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.ec-kb-row {
+  display: flex;
+  gap: 3px;
+  flex: 1;
+}
+
+/* Key Styles */
+.ec-kb-key {
+  position: relative;
+  flex: 1;
+  background: var(--kb-key-bg);
+  border: 1px solid var(--kb-key-border);
+  border-radius: 4px;
+  box-shadow: var(--kb-key-shadow);
+  color: var(--kb-key-color);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+  transition: transform 0.05s ease, background 0.1s ease;
+  min-height: 24px;
+  padding: 1px 2px;
+  line-height: 1.1;
+}
+
+.ec-kb-key:hover {
+  background: var(--kb-key-bg-hover);
+}
+
+.ec-kb-key:active, .ec-kb-key.ec-kb-pressed {
+  background: var(--kb-key-bg-active);
+  box-shadow: 0 1px 0 #18191d;
+  transform: translateY(1px);
+}
+
+/* Modifier Active / Latched */
+.ec-kb-key.ec-kb-mod-active {
+  background: var(--kb-key-mod-active) !important;
+  color: #ffffff !important;
+  border-color: #55a6f8 !important;
+  box-shadow: 0 0 8px rgba(45, 140, 235, 0.6) !important;
+}
+
+/* Locked (Caps Lock, Num Lock) Indicator */
+.ec-kb-key.ec-kb-locked::after {
+  content: "";
+  position: absolute;
+  top: 3px;
+  right: 4px;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: #20e070;
+  box-shadow: 0 0 4px #20e070;
+}
+
+/* Key Sizing variants */
+.ec-kb-key-fn {
+  font-size: 10px;
+  color: #adb0be;
+  min-height: 20px;
+}
+
+.ec-kb-w-1-25 { flex: 1.25; }
+.ec-kb-w-1-5  { flex: 1.5; }
+.ec-kb-w-1-75 { flex: 1.75; }
+.ec-kb-w-2    { flex: 2; }
+.ec-kb-w-2-25 { flex: 2.25; }
+.ec-kb-w-space { flex: 5.5; }
+.ec-kb-h-2    { flex: 2; }
+
+/* Sub labels on keys */
+.ec-kb-sub {
+  font-size: 9px;
+  color: var(--kb-key-sub-color);
+  line-height: 1;
+}
+
+.ec-kb-main-label {
+  font-size: 11px;
+  line-height: 1;
+}
+
+.ec-kb-arrow {
+  font-size: 12px;
+}
