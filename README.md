@@ -16,6 +16,11 @@
   <img src="https://img.shields.io/badge/License-MIT%20%2F%20Apache--2.0-orange?style=for-the-badge" alt="License">
 </p>
 
+<p align="center">
+  <a href="https://discord.gg/xyTRSa9SK"><img src="https://img.shields.io/badge/Discord-Join%20Community-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Discord"></a>
+  <a href="https://t.me/+hAhK5AnoAvI3Y2U1"><img src="https://img.shields.io/badge/Telegram-Join%20Chat-24A1DE?style=for-the-badge&logo=telegram&logoColor=white" alt="Telegram"></a>
+</p>
+
 ---
 
 ## 📱 About EffectCraft Pocket
@@ -74,11 +79,13 @@ Download the latest version from the [Releases](https://github.com/duplexspy/eff
 
 ---
 
-## 💬 Community & Contact
+## 💬 Community & Support
 
-Have feedback, questions, or ideas for the mobile port?
+Join the community to get updates, report bugs, or share your creations:
 
-* **Discord**: Add or message me on Discord at **`@duplexspy`**
+* 🎮 **Discord Server**: [discord.gg/xyTRSa9SK](https://discord.gg/xyTRSa9SK)
+* ✈️ **Telegram Group**: [t.me/+hAhK5AnoAvI3Y2U1](https://t.me/+hAhK5AnoAvI3Y2U1)
+* 👤 **Direct Contact**: Discord `@duplexspy`
 
 ---
 
