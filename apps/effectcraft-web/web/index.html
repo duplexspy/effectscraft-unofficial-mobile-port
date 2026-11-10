@@ -6,11 +6,10 @@
   <meta name="color-scheme" content="dark">
   <meta name="theme-color" content="#1b1c1f">
   <meta name="description" content="EffectCraft: motion graphics and visual effects in the browser">
-  <title>EffectCraft Pocket</title>
+  <title>EffectCraft</title>
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
   <link rel="manifest" href="manifest.webmanifest">
   <link rel="apple-touch-icon" href="icon-256.png">
-  <link rel="stylesheet" href="keyboard.css">
   <style>
     html, body { margin: 0; height: 100%; overflow: hidden; background: #1b1c1f; }
     canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; outline: none; }
@@ -42,7 +41,7 @@
 </head>
 <body>
   <canvas id="effectcraft_canvas"></canvas>
-  <div id="loading"><img src="favicon.svg" alt=""><div id="status">Loading EffectCraft Pocket…</div><div id="substatus" style="font-size:12px;color:#8a8c99;">Initializing…</div></div>
+  <div id="loading"><img src="favicon.svg" alt=""><div id="status">Loading EffectCraft…</div></div>
   <script type="module">
     import init, * as ec from "./effectcraft_web.js";
     const t0 = performance.now();
@@ -72,7 +71,13 @@
         ...ec.info(),
         crossOriginIsolated: self.crossOriginIsolated,
         webgpu: !!navigator.gpu,
-        serviceWorker: !!(navigator.serviceWorker && navigator.serviceWorker.controller),
+        serviceWorker: (() => {
+          try {
+            return !!(navigator.serviceWorker && navigator.serviceWorker.controller);
+          } catch {
+            return false;
+          }
+        })(),
         load: window.effectcraftLoad,
       }),
       // Browser storage (OPFS / IndexedDB): save without downloading, list, remove, wait for writes.
@@ -84,78 +89,35 @@
       workerFrameCheck: (params) => ec.workerFrameCheck(params ?? {}).then(JSON.parse),
     };
     // Offline start and install (PWA): the service worker caches the app's files.
-    if ("serviceWorker" in navigator && !new URLSearchParams(location.search).has("nosw")) {
-      navigator.serviceWorker.register("sw.js").catch((e) => console.warn("service worker:", e));
+    if (!new URLSearchParams(location.search).has("nosw")) {
+      try {
+        if ("serviceWorker" in navigator && navigator.serviceWorker) {
+          navigator.serviceWorker.register("sw.js").catch((e) => console.warn("service worker:", e));
+        }
+      } catch (e) {
+        console.warn("service worker:", e);
+      }
     }
-    const setStatus = (msg) => {
-      const sub = document.getElementById("substatus");
-      if (sub) sub.textContent = msg;
-      console.log("[LoadStep]", msg);
-      if (window.AndroidBridge && window.AndroidBridge.log) {
-        window.AndroidBridge.log("step", msg);
-      }
-    };
-
-    window.addEventListener("error", (ev) => {
-      console.error("[UncaughtError]", ev.message, ev.filename, ev.lineno, ev.error);
-      if (window.AndroidBridge && window.AndroidBridge.reportError) {
-        window.AndroidBridge.reportError(ev.message || "Uncaught Error", ev.error ? (ev.error.stack || String(ev.error)) : `${ev.filename}:${ev.lineno}`);
-      }
-    });
-
-    window.addEventListener("unhandledrejection", (ev) => {
-      console.error("[UnhandledRejection]", ev.reason);
-      if (window.AndroidBridge && window.AndroidBridge.reportError) {
-        window.AndroidBridge.reportError("Unhandled Rejection", ev.reason ? (ev.reason.stack || String(ev.reason)) : "Promise rejected");
-      }
-    });
-
     try {
-      setStatus("Loading WebAssembly module…");
+      // Compile once: the page and its render workers instantiate the same module.
       const wasmUrl = new URL("effectcraft_web_bg.wasm", location.href);
       let module;
       try {
         module = await WebAssembly.compileStreaming(fetch(wasmUrl));
-      } catch (streamErr) {
-        console.warn("compileStreaming fallback:", streamErr);
-        setStatus("Compiling WebAssembly module…");
-        const resp = await fetch(wasmUrl);
-        const bytes = await resp.arrayBuffer();
-        module = await WebAssembly.compile(bytes);
+      } catch {
+        module = await WebAssembly.compile(await (await fetch(wasmUrl)).arrayBuffer());
       }
-      setStatus("Initializing Rust runtime…");
+      window.effectcraftModule = module;
       await init({ module_or_path: module });
-      // Clear reference so V8 can free compilation buffers before engine allocations
-      module = null;
       window.effectcraftLoad.wasmMs = performance.now() - t0;
-
-      setStatus("Starting EffectCraft Pocket UI & Canvas…");
       await ec.start("effectcraft_canvas");
       window.effectcraftLoad.readyMs = performance.now() - t0;
-      if (window.AndroidBridge && window.AndroidBridge.onAppReady) {
-        window.AndroidBridge.onAppReady();
-      }
     } catch (e) {
-      console.error("EffectCraft Pocket start error:", e);
-      const errMsg = (e && (e.stack || e.message)) ? String(e.stack || e.message) : String(e);
-      if (window.AndroidBridge && window.AndroidBridge.reportError) {
-        window.AndroidBridge.reportError(String(e), errMsg);
-      }
       const s = document.getElementById("status");
-      const sub = document.getElementById("substatus");
-      if (s) {
-        s.className = "err";
-        s.textContent = "EffectCraft Pocket could not start:\n" + errMsg;
-      }
-      if (sub) {
-        sub.innerHTML = "<div style='display:flex;gap:10px;margin-top:14px;'>" +
-          "<button onclick='location.reload()' style='padding:10px 20px;background:#2d8ceb;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:600;'>Retry</button>" +
-          "<button onclick='location.href=\"index.html?nosw&noworkers&home&empty&webgl\"' style='padding:10px 20px;background:#383942;color:#e3e3e3;border:1px solid #555;border-radius:6px;cursor:pointer;'>Clean Home Start</button>" +
-          "</div>";
-      }
-      window.effectcraftLoad.error = errMsg;
+      if (s) { s.className = "err"; s.textContent = "EffectCraft failed to start:\n" + (e && e.stack || e); }
+      window.effectcraftLoad.error = String(e);
+      throw e;
     }
   </script>
-  <script src="keyboard.js"></script>
 </body>
 </html>

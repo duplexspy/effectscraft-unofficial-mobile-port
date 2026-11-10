@@ -1,17 +1,22 @@
 //! Composition viewer maths shared by the frontends and tests: snapping (targets, tolerance and
-//! priority), the Show Channel / Exposure display transforms, and the viewer snapshot.
+//! priority), the display pass (Show Channel, exposure, display colour), and the viewer snapshot.
 //!
 //! Nothing here touches the project; edits go through commands.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use effectcraft_color::{ColorSpace, space};
 use effectcraft_geom::{Mat3, vec2};
-use effectcraft_project::{Layer, LayerId};
+use effectcraft_keyframe::Value;
+use effectcraft_project::{Layer, LayerId, Property};
 use effectcraft_raster::Image;
-use effectcraft_render::EvalCtx;
+use effectcraft_render::{EvalCtx, ExprHost};
 use effectcraft_time::Tick;
 use serde::{Deserialize, Serialize};
+
+mod display_pass;
+pub use display_pass::{DisplayPass, FrameEncoding, PassColor, PassConv, PassCurve, SHADER_EXPONENTS, hdr_step, lut_eval};
 
 // ---------------------------------------------------------------- snapping
 
@@ -46,7 +51,7 @@ pub struct SnapTarget {
     pub priority: u8,
     pub source: SnapSource,
     /// A line's extent along itself (y of a vertical line, x of a horizontal one): a layer's
-    /// edge without Snap Edges Extended. `None` runs across the whole comp.
+    /// edge or centre line without Snap Edges Extended. `None` runs across the whole comp.
     #[serde(default)]
     pub span: Option<[f64; 2]>,
 }
@@ -67,48 +72,34 @@ impl SnapTarget {
     }
 }
 
-/// Tools bar ▸ Snapping options: which layer features snap (the dragged layer's and the
-/// targets), and Snap Edges Extended (layer edges snap along their whole line, beyond the
-/// layer's bounds). Everything is on by default.
+/// Tools bar ▸ Snapping options, the two After Effects' Snapping menu has: Snap Edges Extended
+/// (layer edge and centre lines snap along their whole line, beyond the layer's bounds) and Snap to Features in
+/// Collapsed Compositions and Text Layers (the layers inside a precomp layer with Collapse
+/// Transformations on are targets too). Both are on by default. Every layer feature snaps
+/// (corners, edge midpoints, centre, anchor point, mask and shape path points), as in After
+/// Effects.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct SnapFeatures {
     pub edges_extended: bool,
-    /// Edges and edge midpoints of layers, and the comp's edges.
-    pub edges: bool,
-    pub corners: bool,
-    /// Layer centres and the comp's centre.
-    pub centers: bool,
-    pub anchor_points: bool,
-    /// Mask and shape path points.
-    pub paths: bool,
+    pub collapsed_features: bool,
 }
 
 impl Default for SnapFeatures {
     fn default() -> Self {
-        SnapFeatures { edges_extended: true, edges: true, corners: true, centers: true, anchor_points: true, paths: true }
+        SnapFeatures { edges_extended: true, collapsed_features: true }
     }
 }
 
 impl SnapFeatures {
     /// The options in the Tools bar's Snapping menu order: (parameter key, label).
-    pub const OPTIONS: [(&'static str, &'static str); 6] = [
-        ("edgesExtended", "Snap Edges Extended"),
-        ("edges", "Edges"),
-        ("corners", "Corners"),
-        ("centers", "Centers"),
-        ("anchorPoints", "Anchor Points"),
-        ("paths", "Mask and Shape Path Points"),
-    ];
+    pub const OPTIONS: [(&'static str, &'static str); 2] =
+        [("edgesExtended", "Snap Edges Extended"), ("collapsedFeatures", "Snap to Features in Collapsed Compositions and Text Layers")];
     /// The option called `key` (an [`OPTIONS`](Self::OPTIONS) key).
     pub fn option_mut(&mut self, key: &str) -> Option<&mut bool> {
         Some(match key {
             "edgesExtended" => &mut self.edges_extended,
-            "edges" => &mut self.edges,
-            "corners" => &mut self.corners,
-            "centers" => &mut self.centers,
-            "anchorPoints" => &mut self.anchor_points,
-            "paths" => &mut self.paths,
+            "collapsedFeatures" => &mut self.collapsed_features,
             _ => return None,
         })
     }
@@ -138,9 +129,10 @@ fn better(a: (f64, u8), b: (f64, u8)) -> bool {
 }
 
 /// Snap feature points `sources` (comp pixels) to the nearest target within `tol` comp pixels.
-/// A point target snaps both axes and wins when it is at least as near as the best lines;
-/// otherwise the nearest vertical and horizontal lines snap x and y independently. Ties go to
-/// the lower priority value.
+/// A point target snaps both axes and wins unless a vertical and a horizontal line both resolve
+/// and together lie nearer than it (one line alone leaves the other axis free, so it never beats
+/// a point: a layer's edge midpoint lies on its edge line); otherwise the nearest vertical and
+/// horizontal lines snap x and y independently. Ties go to the lower priority value.
 pub fn snap(sources: &[[f64; 2]], targets: &[SnapTarget], tol: f64) -> Option<Snap> {
     let mut best_pt: Option<((f64, u8), [f64; 2], SnapTarget)> = None;
     let mut best_x: Option<((f64, u8), [f64; 2], SnapTarget)> = None;
@@ -162,9 +154,9 @@ pub fn snap(sources: &[[f64; 2]], targets: &[SnapTarget], tol: f64) -> Option<Sn
             }
         }
     }
-    let line_best = [best_x.map(|b| b.0.0), best_y.map(|b| b.0.0)].into_iter().flatten().fold(f64::INFINITY, f64::min);
+    let both_lines = best_x.zip(best_y).map_or(f64::INFINITY, |(x, y)| x.0.0.hypot(y.0.0));
     if let Some((k, s, t)) = best_pt
-        && k.0 <= line_best + 1e-9
+        && k.0 <= both_lines + 1e-9
     {
         return Some(Snap { delta: [t.pos[0] - s[0], t.pos[1] - s[1]], hits: vec![t], at: t.pos });
     }
@@ -187,15 +179,13 @@ pub fn snap(sources: &[[f64; 2]], targets: &[SnapTarget], tol: f64) -> Option<Sn
     Some(Snap { delta, hits, at })
 }
 
-/// Snap features of a layer in comp space that `f` turns on: corners, edge midpoints, centre,
-/// anchor point and mask / shape path vertices (no box for layers without bounds).
-pub fn layer_features(ctx: &EvalCtx, layer: &Layer, f: SnapFeatures) -> Vec<[f64; 2]> {
+/// Snap features of a layer in comp space: corners, edge midpoints, centre, anchor point and
+/// mask / shape path vertices (no box for layers without bounds).
+pub fn layer_features(ctx: &EvalCtx, layer: &Layer) -> Vec<[f64; 2]> {
     let (m, _) = ctx.layer_to_comp(layer);
-    let mut out = layer_box(ctx, layer, &m).map(|b| b.features(f)).unwrap_or_default();
-    out.extend(anchor_feature(ctx, layer, &m).filter(|_| f.anchor_points));
-    if f.paths {
-        out.extend(layer_vertices(ctx, layer));
-    }
+    let mut out = layer_box(ctx, layer, &m).map(|b| b.points()).unwrap_or_default();
+    out.extend(anchor_feature(ctx, layer, &m));
+    out.extend(layer_vertices(ctx, layer));
     out
 }
 
@@ -208,19 +198,9 @@ struct BoxPoints {
 }
 
 impl BoxPoints {
-    /// The points `f` turns on.
-    fn features(&self, f: SnapFeatures) -> Vec<[f64; 2]> {
-        let mut out = vec![];
-        if f.corners {
-            out.extend(self.corners);
-        }
-        if f.edges {
-            out.extend(self.mids);
-        }
-        if f.centers {
-            out.push(self.center);
-        }
-        out
+    /// Corners, edge midpoints and centre.
+    fn points(&self) -> Vec<[f64; 2]> {
+        self.corners.iter().chain(&self.mids).chain([&self.center]).copied().collect()
     }
 }
 
@@ -300,10 +280,45 @@ pub struct SnapOptions {
     pub grid_spacing: f64,
 }
 
+type SnapValues = HashMap<(u64, u64, u64, i64), Result<Value, String>>;
+
+/// Bounds, vertices and transforms can ask for the same expression repeatedly. Share its
+/// value only within this immutable snap query; a new pointer update starts a fresh cache.
+struct SnapExpressions<'a> {
+    inner: &'a dyn ExprHost,
+    values: Mutex<SnapValues>,
+}
+
+impl ExprHost for SnapExpressions<'_> {
+    fn eval(&self, ctx: &EvalCtx, layer: &Layer, prop: &Property, value: &Value) -> Result<Value, String> {
+        let key = (ctx.comp_id.0, layer.id.0, prop.uid, ctx.time.0);
+        if let Some(value) = self.values.lock().unwrap_or_else(PoisonError::into_inner).get(&key).cloned() {
+            return value;
+        }
+        // Never hold the lock while evaluating: expressions may query other properties.
+        let result = self.inner.eval(ctx, layer, prop, value);
+        let mut values = self.values.lock().unwrap_or_else(PoisonError::into_inner);
+        if values.len() < 8192 {
+            values.insert(key, result.clone());
+        }
+        result
+    }
+
+    fn eval_text_selector(&self, ctx: &EvalCtx, layer: &Layer, prop: &Property, index: usize, total: usize, selector: [f64; 3]) -> Result<[f64; 3], String> {
+        self.inner.eval_text_selector(ctx, layer, prop, index, total, selector)
+    }
+}
+
 /// Snap targets of a comp at the context time: other visible layers' features and vertices and
-/// the comp's edges and centre (with `layers`, as `features` allows), and guides and grid lines
-/// (when on). Layers in `exclude` (the dragged ones) are skipped.
+/// the comp's edges and centre (with `layers`, as the Snapping options allow), and guides and
+/// grid lines (when on). Layers in `exclude` (the dragged ones) are skipped.
 pub fn targets(ctx: &EvalCtx, exclude: &[LayerId], opts: SnapOptions) -> Vec<SnapTarget> {
+    let memo = ctx.expr.map(|inner| SnapExpressions { inner, values: Mutex::default() });
+    let ctx = EvalCtx { expr: memo.as_ref().map(|h| h as &dyn ExprHost), ..*ctx };
+    targets_in(&ctx, exclude, opts)
+}
+
+fn targets_in(ctx: &EvalCtx, exclude: &[LayerId], opts: SnapOptions) -> Vec<SnapTarget> {
     let comp = ctx.comp;
     let (w, h) = (comp.width as f64, comp.height as f64);
     let f = opts.features;
@@ -315,27 +330,17 @@ pub fn targets(ctx: &EvalCtx, exclude: &[LayerId], opts: SnapOptions) -> Vec<Sna
             out.extend(x.iter().map(|x| SnapTarget::vline(*x, PRI_COMP, SnapSource::Comp).within(ys)));
             out.extend(y.iter().map(|y| SnapTarget::hline(*y, PRI_COMP, SnapSource::Comp).within(xs)));
         };
-        if f.edges {
-            lines(&[0.0, w], &[0.0, h]);
-        }
-        if f.centers {
-            lines(&[w / 2.0], &[h / 2.0]);
-            out.push(SnapTarget::point([w / 2.0, h / 2.0], PRI_COMP, SnapSource::Comp));
-        }
-        // Visible layers: eye on, and soloed while any layer is.
-        let any_solo = comp.layers.iter().any(|l| l.switches.solo && l.source.is_av() && l.is_active_at(ctx.time));
-        let visible = |l: &&Layer| l.is_active_at(ctx.time) && l.switches.video && (!any_solo || l.switches.solo) && !exclude.contains(&l.id);
-        for l in comp.layers.iter().filter(visible) {
+        lines(&[0.0, w], &[0.0, h]);
+        lines(&[w / 2.0], &[h / 2.0]);
+        out.push(SnapTarget::point([w / 2.0, h / 2.0], PRI_COMP, SnapSource::Comp));
+        for l in visible_layers(ctx, exclude) {
             out.extend(layer_targets(ctx, l, true, f));
         }
     }
     if opts.guides {
         for g in &comp.guides {
-            out.push(if g.vertical {
-                SnapTarget::vline(g.position, PRI_GUIDE, SnapSource::Guide)
-            } else {
-                SnapTarget::hline(g.position, PRI_GUIDE, SnapSource::Guide)
-            });
+            let pos = g.px(comp.width, comp.height);
+            out.push(if g.vertical { SnapTarget::vline(pos, PRI_GUIDE, SnapSource::Guide) } else { SnapTarget::hline(pos, PRI_GUIDE, SnapSource::Guide) });
         }
     }
     if opts.grid && opts.grid_spacing >= 1.0 {
@@ -354,11 +359,27 @@ pub fn targets(ctx: &EvalCtx, exclude: &[LayerId], opts: SnapOptions) -> Vec<Sna
     out
 }
 
-/// A 2D layer's snap targets as `f` allows: its box points, its edges as lines while unrotated
-/// (across the comp with Snap Edges Extended, along the layer otherwise), its anchor point
-/// unless `anchor` is false (Pan Behind drags it, the box stays put) and its mask and shape path
-/// vertices. None for cameras, lights and 3D layers.
+/// How deep Snap to Features in Collapsed Compositions looks into nested collapsed precomps.
+const MAX_COLLAPSED_DEPTH: usize = 8;
+
+/// Visible layers of a comp at the context time: active, eye on, and soloed while any layer is.
+fn visible_layers<'a>(ctx: &EvalCtx<'a>, exclude: &'a [LayerId]) -> impl Iterator<Item = &'a Layer> {
+    let comp = ctx.comp;
+    let time = ctx.time;
+    let any_solo = comp.layers.iter().any(|l| l.switches.solo && l.source.is_av());
+    comp.layers.iter().filter(move |l| l.is_active_at(time) && l.switches.video && (!any_solo || l.switches.solo) && !exclude.contains(&l.id))
+}
+
+/// A 2D layer's snap targets: its box points, its edges and centre as lines while unrotated (across
+/// the comp with Snap Edges Extended, along the layer otherwise), its anchor point unless `anchor` is
+/// false (Pan Behind drags it, the box stays put), its mask and shape path vertices and, with
+/// Snap to Features in Collapsed Compositions, the targets of the visible layers inside a
+/// collapsed precomp layer. None for cameras, lights and 3D layers.
 pub fn layer_targets(ctx: &EvalCtx, l: &Layer, anchor: bool, f: SnapFeatures) -> Vec<SnapTarget> {
+    layer_targets_at(ctx, l, anchor, f, 0)
+}
+
+fn layer_targets_at(ctx: &EvalCtx, l: &Layer, anchor: bool, f: SnapFeatures, depth: usize) -> Vec<SnapTarget> {
     if l.is_camera() || l.is_light() || l.is_3d() {
         return vec![];
     }
@@ -367,20 +388,67 @@ pub fn layer_targets(ctx: &EvalCtx, l: &Layer, anchor: bool, f: SnapFeatures) ->
     let mut out = vec![];
     if let Some(b) = layer_box(ctx, l, &m) {
         let [nw, ne, _, sw] = b.corners;
-        if f.edges && (nw[1] - ne[1]).abs() < 1e-6 && (nw[0] - sw[0]).abs() < 1e-6 {
+        if (nw[1] - ne[1]).abs() < 1e-6 && (nw[0] - sw[0]).abs() < 1e-6 {
             let (xs, ys) = if f.edges_extended { (None, None) } else { (Some([nw[0], ne[0]]), Some([nw[1], sw[1]])) };
-            for x in [nw[0], ne[0]] {
+            for x in [nw[0], b.center[0], ne[0]] {
                 out.push(SnapTarget::vline(x, PRI_LAYER, src).within(ys));
             }
-            for y in [nw[1], sw[1]] {
+            for y in [nw[1], b.center[1], sw[1]] {
                 out.push(SnapTarget::hline(y, PRI_LAYER, src).within(xs));
             }
         }
-        out.extend(b.features(f).into_iter().map(|p| SnapTarget::point(p, PRI_LAYER, src)));
+        out.extend(b.points().into_iter().map(|p| SnapTarget::point(p, PRI_LAYER, src)));
     }
-    out.extend(anchor_feature(ctx, l, &m).filter(|_| anchor && f.anchor_points).map(|p| SnapTarget::point(p, PRI_LAYER, src)));
-    if f.paths {
-        out.extend(layer_vertices(ctx, l).into_iter().map(|p| SnapTarget::point(p, PRI_VERTEX, SnapSource::Vertex(l.id))));
+    out.extend(anchor_feature(ctx, l, &m).filter(|_| anchor).map(|p| SnapTarget::point(p, PRI_LAYER, src)));
+    out.extend(layer_vertices(ctx, l).into_iter().map(|p| SnapTarget::point(p, PRI_VERTEX, SnapSource::Vertex(l.id))));
+    if f.collapsed_features
+        && l.switches.collapse
+        && depth < MAX_COLLAPSED_DEPTH
+        && let effectcraft_project::LayerSource::Comp { item } = l.source
+        && let Some(nc) = ctx.project.comp(item)
+    {
+        out.extend(collapsed_targets(ctx, l, item, nc, &m, f, depth));
+    }
+    out
+}
+
+/// The targets of the layers inside collapsed precomp layer `l` (showing comp `nc`), in the
+/// outer comp (`m`: `l`'s layer → comp). They highlight `l` when they snap. Lines stay lines
+/// only while `l` is unrotated; otherwise only the points snap.
+fn collapsed_targets(
+    ctx: &EvalCtx,
+    l: &Layer,
+    item: effectcraft_project::ItemId,
+    nc: &effectcraft_project::Comp,
+    m: &Mat3,
+    f: SnapFeatures,
+    depth: usize,
+) -> Vec<SnapTarget> {
+    let nctx = EvalCtx { comp_id: item, comp: nc, time: ctx.nested_time(l), ..*ctx };
+    let axis_aligned = m.0[0][1].abs() < 1e-9 && m.0[1][0].abs() < 1e-9;
+    let (sx, ox, sy, oy) = (m.0[0][0], m.0[0][2], m.0[1][1], m.0[1][2]);
+    let mut out = vec![];
+    for nl in visible_layers(&nctx, &[]) {
+        for t in layer_targets_at(&nctx, nl, true, f, depth + 1) {
+            let source = match t.source {
+                SnapSource::Vertex(_) => SnapSource::Vertex(l.id),
+                _ => SnapSource::Layer(l.id),
+            };
+            let mapped = match t.kind {
+                SnapKind::Point => {
+                    let q = m.apply(vec2(t.pos[0], t.pos[1]));
+                    Some(SnapTarget::point([q.x, q.y], t.priority, source))
+                }
+                SnapKind::VLine if axis_aligned => {
+                    Some(SnapTarget::vline(sx * t.pos[0] + ox, t.priority, source).within(t.span.map(|[a, b]| [sy * a + oy, sy * b + oy])))
+                }
+                SnapKind::HLine if axis_aligned => {
+                    Some(SnapTarget::hline(sy * t.pos[1] + oy, t.priority, source).within(t.span.map(|[a, b]| [sx * a + ox, sx * b + ox])))
+                }
+                _ => None,
+            };
+            out.extend(mapped);
+        }
     }
     out
 }
@@ -433,63 +501,6 @@ fn srgb_to_linear(v: f32) -> f32 {
 fn linear_to_srgb(v: f32) -> f32 {
     let v = v.max(0.0);
     if v <= 0.003_130_8 { v * 12.92 } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 }
-}
-
-/// 8-bit exposure lookup table: `stops` applied in linear light.
-pub fn exposure_lut(stops: f32) -> [u8; 256] {
-    let k = 2f32.powf(stops);
-    let mut lut = [0u8; 256];
-    for (i, o) in lut.iter_mut().enumerate() {
-        let lin = srgb_to_linear(i as f32 / 255.0) * k;
-        *o = (linear_to_srgb(lin).clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-    }
-    lut
-}
-
-/// Apply the viewer's channel and exposure to premultiplied 8-bit RGBA pixels in place.
-/// RGB shows the image (exposure only); Red/Green/Blue/Alpha show one channel as an opaque
-/// grayscale image (or tinted in that channel's colour when `colorized`); RGB Straight shows the
-/// unpremultiplied colour, opaque.
-pub fn display_transform(px: &mut [[u8; 4]], channel: Channel, colorized: bool, stops: f32) {
-    let lut = (stops != 0.0).then(|| exposure_lut(stops));
-    let ex = |v: u8| lut.as_ref().map(|l| l[v as usize]).unwrap_or(v);
-    for p in px.iter_mut() {
-        let [r, g, b, a] = *p;
-        *p = match channel {
-            Channel::Rgb => {
-                if lut.is_none() {
-                    continue;
-                }
-                // Exposure on straight colour, re-premultiplied.
-                let un = |c: u8| if a == 0 { 0 } else { ((c as u32 * 255 + a as u32 / 2) / a as u32).min(255) as u8 };
-                let pm = |c: u8| ((ex(un(c)) as u32 * a as u32 + 127) / 255) as u8;
-                [pm(r), pm(g), pm(b), a]
-            }
-            Channel::Red | Channel::Green | Channel::Blue => {
-                let (i, c) = match channel {
-                    Channel::Red => (0, r),
-                    Channel::Green => (1, g),
-                    _ => (2, b),
-                };
-                let v = ex(c);
-                if colorized {
-                    let mut o = [0, 0, 0, 255];
-                    o[i] = v;
-                    o
-                } else {
-                    [v, v, v, 255]
-                }
-            }
-            Channel::Alpha => {
-                let v = ex(a);
-                [v, v, v, 255]
-            }
-            Channel::RgbStraight => {
-                let un = |c: u8| if a == 0 { 0 } else { ((c as u32 * 255 + a as u32 / 2) / a as u32).min(255) as u8 };
-                [ex(un(r)), ex(un(g)), ex(un(b)), 255]
-            }
-        };
-    }
 }
 
 // ---------------------------------------------------------------- display colour management
@@ -599,10 +610,10 @@ impl SimProfile {
     }
 
     pub fn parse(s: &str) -> Option<SimProfile> {
-        let k: String = s.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_ascii_lowercase();
+        let k: String = s.chars().filter(char::is_ascii_alphanumeric).collect::<String>().to_ascii_lowercase();
         SimProfile::ALL
             .into_iter()
-            .find(|p| p.id().to_ascii_lowercase() == k || p.label().chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_ascii_lowercase() == k)
+            .find(|p| p.id().to_ascii_lowercase() == k || p.label().chars().filter(char::is_ascii_alphanumeric).collect::<String>().to_ascii_lowercase() == k)
             .or(match k.as_str() {
                 "off" => Some(SimProfile::None),
                 "hdtv" | "bt709" => Some(SimProfile::Rec709),
@@ -934,6 +945,12 @@ impl DisplayColor {
         )
     }
 
+    /// A conversion that is a baked 3D LUT alone, as a LUT-based My Custom RGB profile makes
+    /// (tests of the display pass).
+    pub fn from_lut(lut: Arc<effectcraft_color::icc::Lut3d>) -> DisplayColor {
+        DisplayColor { sim: None, display: None, lut: Some(lut) }
+    }
+
     /// Whether the simulation runs a LUT-based ICC profile (baked into a 3D LUT).
     pub fn is_lut(&self) -> bool {
         self.lut.is_some()
@@ -1032,4 +1049,49 @@ pub struct Snapshot {
     /// Render scale the image was taken at.
     pub scale: f64,
     pub image: Arc<Image>,
+    /// How `image` is encoded: rendered without the HDR step in 32 bpc, so viewer exposure
+    /// reaches its over-range values; the display pass applies the step.
+    pub encoding: FrameEncoding,
+}
+
+#[cfg(test)]
+mod snap_expression_tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct PositionHost(AtomicUsize);
+    impl ExprHost for PositionHost {
+        fn eval(&self, ctx: &EvalCtx, _: &Layer, _: &Property, value: &Value) -> Result<Value, String> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            let v = value.components();
+            Ok(Value::Vec3([v[0] + 10. * ctx.time.seconds(), v[1], 0.]))
+        }
+    }
+
+    #[test]
+    fn snapping_reuses_expressions_within_one_query_but_refreshes_time_and_edits() {
+        let mut s = crate::Session::default();
+        s.execute("comp.new", json!({"width":320,"height":180,"duration":5})).unwrap();
+        let lid = s.execute("layer.newSolid", json!({"width":40,"height":20})).unwrap()["layer"].as_u64().unwrap();
+        s.execute("prop.setExpression", json!({"layer":lid,"path":"transform/position","expression":"value"})).unwrap();
+        let cid = s.active_comp_id().unwrap();
+        let host = PositionHost(AtomicUsize::new(0));
+        let opts = SnapOptions { layers: true, ..Default::default() };
+        let query = |s: &crate::Session, time, cached| {
+            let ctx = EvalCtx { expr: Some(&host), ..EvalCtx::new(&s.project, cid, s.project.comp(cid).unwrap(), time) };
+            if cached { targets(&ctx, &[], opts) } else { targets_in(&ctx, &[], opts) }
+        };
+        let expected = query(&s, Tick::ZERO, false);
+        assert!(host.0.swap(0, Ordering::Relaxed) > 1, "fixture must visit the same expression for multiple geometry features");
+        assert_eq!(query(&s, Tick::ZERO, true), expected);
+        assert_eq!(host.0.swap(0, Ordering::Relaxed), 1);
+        let moved = query(&s, Tick::from_seconds_f64(1.), true);
+        assert_ne!(moved, expected, "a new time must not reuse stale targets");
+        assert_eq!(host.0.swap(0, Ordering::Relaxed), 1);
+        s.execute("prop.set", json!({"layer":lid,"path":"transform/position","value":[200,100,0]})).unwrap();
+        let edited = query(&s, Tick::ZERO, true);
+        assert_ne!(edited, expected, "a new project revision must not reuse stale targets");
+        assert_eq!(host.0.swap(0, Ordering::Relaxed), 1);
+    }
 }

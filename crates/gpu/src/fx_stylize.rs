@@ -125,7 +125,7 @@ fn run(e: &mut Enc, entry: &str, p: &Params, mut b: GBuf, data: Option<&wgpu::Bu
 
 /// util::layer_rect.
 fn layer_rect(ctx: &EffectCtx, b: &GBuf) -> (f64, f64, f64, f64) {
-    (b.offset[0], b.offset[1], ctx.layer_size[0] * b.scale, ctx.layer_size[1] * b.scale)
+    effectcraft_effects::util::layer_rect_at(ctx, b.offset, b.scale)
 }
 
 // ---------------------------------------------------------------- per-pixel (fxs_point)
@@ -299,10 +299,13 @@ fn cc_slant(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
     )
 }
 
-fn cc_smear(e: &mut Enc, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
+fn cc_smear(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
+    let reach = ctx.params.f("reach") / 100.0;
+    if !ctx.adjustment {
+        b.pad(e, effectcraft_effects::cc_smear_pad(ctx, [b.img.width, b.img.height], b.offset, b.scale))?;
+    }
     let from = b.to_px(ctx.params.v2("from"));
     let to = b.to_px(ctx.params.v2("to"));
-    let reach = ctx.params.f("reach") / 100.0;
     let radius = (ctx.params.f("radius") * b.scale).max(0.5);
     let (dx, dy) = (to.0 - from.0, to.1 - from.1);
     let l2 = dx * dx + dy * dy;
@@ -486,6 +489,9 @@ fn ripple_pulse(e: &mut Enc, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
 }
 
 fn power_pin(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
+    if ctx.params.b("unstretch") {
+        return None; // Unstretch (reverse pinning) renders on the CPU (catalog CPU_ONLY_CONTROLS).
+    }
     let persp = (ctx.params.f("perspective") / 100.0).clamp(0.0, 1.0);
     let (lw, lh) = (ctx.layer_size[0].max(1.0), ctx.layer_size[1].max(1.0));
     let ex = [ctx.params.f("expandTop"), ctx.params.f("expandLeft"), ctx.params.f("expandRight"), ctx.params.f("expandBottom")];
@@ -582,8 +588,11 @@ fn offset(e: &mut Enc, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
     table(e, b, &data, false, blend.max(0.0))
 }
 
-fn cc_tiler(e: &mut Enc, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
+fn cc_tiler(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
     let s = (ctx.params.f("scale") / 100.0).max(0.001);
+    if !ctx.adjustment {
+        b.pad(e, effectcraft_effects::util::layer_cover_pad(ctx, [b.img.width, b.img.height], b.offset, b.scale))?;
+    }
     let c = b.to_px(ctx.params.v2("center"));
     let blend = (ctx.params.f("blendWithOriginal") / 100.0) as f32;
     let (x0, y0, w, h) = layer_rect(ctx, &b);
@@ -628,13 +637,7 @@ fn motion_tile(e: &mut Enc, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
     let mirror = ctx.params.b("mirrorEdges");
     let phase = ctx.params.f("phase") / 360.0;
     let hshift = ctx.params.b("horizontalPhaseShift");
-    let (nw, nh, noff) = if ctx.adjustment {
-        (b.img.width, b.img.height, b.offset)
-    } else {
-        let ow = (lw * ctx.params.f("outputWidth") / 100.0).max(1.0 / s);
-        let oh = (lh * ctx.params.f("outputHeight") / 100.0).max(1.0 / s);
-        ((ow * s).round().max(1.0) as u32, (oh * s).round().max(1.0) as u32, [(ow - lw) * 0.5 * s, (oh - lh) * 0.5 * s])
-    };
+    let (nw, nh, noff) = effectcraft_effects::motion_tile_frame(ctx, b.offset, (b.img.width, b.img.height), s);
     if !e.g.fits(nw, nh) {
         return None;
     }
@@ -868,6 +871,17 @@ fn texturize(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
 
 fn corner_pin(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
     let (w, h) = (ctx.layer_size[0].max(1.0), ctx.layer_size[1].max(1.0));
+    // Grow to hold the whole quad, like the CPU `corner_pin`.
+    if !ctx.adjustment {
+        let pts = ["ul", "ur", "lr", "ll"].map(|k| {
+            let p = b.to_px(ctx.params.v2(k));
+            [p.0, p.1]
+        });
+        let (lo, hi) = effectcraft_effects::quad_bounds(&pts);
+        if let Some(sides) = effectcraft_effects::grow_sides(lo, hi, b.img.width, b.img.height) {
+            b.pad_sides(e, sides)?;
+        }
+    }
     let q = ["ul", "ur", "lr", "ll"].map(|k| {
         let p = b.to_px(ctx.params.v2(k));
         vec2(p.0, p.1)
@@ -876,7 +890,7 @@ fn corner_pin(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
     let o = b.to_px([0.0, 0.0]);
     let m = quad * Mat3::scale(vec2(1.0 / (w * b.scale), 1.0 / (h * b.scale))) * Mat3::translate(vec2(-o.0, -o.1));
     let empty = e.image(b.img.width, b.img.height);
-    b.img = ops::warp(e, &empty, &b.img, &m, Sampling::Bilinear, BlendMode::Normal, 1.0, 0, None);
+    b.img = ops::warp(e, &empty, &b.img, &m, ops::WarpOptions { sampling: Sampling::Bilinear, mode: BlendMode::Normal, opacity: 1.0, seed: 0 }, None);
     Some(b)
 }
 
@@ -934,11 +948,12 @@ pub(crate) fn glow(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
         p.f[2] = ctx.params.color("colorB");
         e.pixels("glow_bright", &p, &b.img, None, &bright, None);
     }
-    let s = (radius / 2.0).max(0.5);
+    let s = effectcraft_effects::glow_sigma(radius);
     let blurred = gaussian_blur(e, &bright, s * kx, s * ky, false);
     let operation = ctx.params.e("operation");
     let glow_op = effectcraft_effects::glow_operation(ctx);
     let mut p = Params::default();
+    p.u[0][1] = (ctx.params.e("based") == 0) as u32;
     p.f[0][0] = intensity;
     let out = e.scratch(b.img.width, b.img.height);
     if operation == 0 && glow_op != BlendMode::Add {
@@ -960,15 +975,7 @@ pub(crate) fn transform_blur(ctx: &EffectCtx) -> bool {
 
 /// distort::transform_matrix.
 fn transform_matrix(pr: &effectcraft_effects::Params, b: &GBuf) -> Mat3 {
-    let anchor = b.to_px(pr.v2("anchor"));
-    let pos = b.to_px(pr.v2("position"));
-    let sh = pr.f("scaleHeight");
-    let sw = if pr.b("uniform") { sh } else { pr.f("scaleWidth") };
-    Mat3::translate(vec2(pos.0, pos.1))
-        * Mat3::rotate_deg(pr.f("rotation"))
-        * Mat3::skew_deg(pr.f("skew"), pr.f("skewAxis"))
-        * Mat3::scale(vec2(sw / 100.0, sh / 100.0))
-        * Mat3::translate(vec2(-anchor.0, -anchor.1))
+    effectcraft_effects::transform_matrix_px(pr, |p| b.to_px(p))
 }
 
 /// distort::transform's motion blur: the transform at Samples instants across the shutter,
@@ -978,15 +985,24 @@ pub(crate) fn transform(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBu
     let host = ctx.env.host?;
     let sampling = if ctx.params.e("sampling") == 1 { Sampling::Bicubic } else { Sampling::Bilinear };
     let fd = 1.0 / ctx.fps();
+    let samples: Vec<effectcraft_effects::Params> =
+        (0..n).filter_map(|k| host.params_at(ctx.time + (phase + angle * k as f64 / (n - 1) as f64) / 360.0 * fd)).collect();
+    if samples.is_empty() {
+        // The CPU renders the frame sharp.
+        return None;
+    }
+    if !ctx.adjustment {
+        let ms: Vec<Mat3> = samples.iter().map(|pr| transform_matrix(pr, &b)).collect();
+        let sides = effectcraft_effects::transform_grow(&ms, b.img.width, b.img.height);
+        b.pad_sides(e, sides)?;
+    }
     let (w, h) = (b.img.width, b.img.height);
     let mut acc = e.image(w, h);
     let mut count = 0u32;
-    for k in 0..n {
-        let t = ctx.time + (phase + angle * k as f64 / (n - 1) as f64) / 360.0 * fd;
-        let Some(pr) = host.params_at(t) else { continue };
+    for pr in &samples {
         let op = pr.f("opacity") as f32 / 100.0;
         let empty = e.image(w, h);
-        let one = ops::warp(e, &empty, &b.img, &transform_matrix(&pr, &b), sampling, BlendMode::Normal, op, 0, None);
+        let one = ops::warp(e, &empty, &b.img, &transform_matrix(pr, &b), ops::WarpOptions { sampling, mode: BlendMode::Normal, opacity: op, seed: 0 }, None);
         let sum = e.image(w, h);
         e.pixels("fxs_add", &Params::default(), &acc, Some(&one), &sum, None);
         acc = sum;

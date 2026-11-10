@@ -5,8 +5,10 @@
 //! Revert only asks to discard. Agents running commands with `engine.execute` are never asked.
 //!
 //! Automation ids: `dialog.unsaved.save`, `dialog.unsaved.dontSave` (Revert: `dialog.unsaved.revert`),
-//! `dialog.unsaved.cancel`.
+//! `dialog.unsaved.cancel`. Enter answers Save, Cmd+Backspace (Ctrl elsewhere) Don't Save and, in
+//! the Revert prompt, Cmd+R Revert.
 
+use crate::i18n::tr;
 use egui::{Color32, vec2};
 use serde_json::{Value, json};
 
@@ -14,7 +16,16 @@ use crate::theme::Tokens;
 use crate::{Dialog, EffectcraftApp};
 
 /// Commands that replace or close the open project (Quit is asked when the window closes).
-const CLOSING: &[&str] = &["file.newProject", "file.open", "file.openRecent", "file.closeProject", "file.revert", "file.openDemoProject", "templates.create"];
+const CLOSING: &[&str] = &[
+    "file.newProject",
+    "file.open",
+    "file.openRecent",
+    "file.closeProject",
+    "file.revert",
+    "file.openDemoProject",
+    "templates.create",
+    "file.runShutdownScripts",
+];
 
 /// The command waiting on the prompt, and whether the user already answered it.
 #[derive(Clone, Debug, Default)]
@@ -56,6 +67,15 @@ pub fn on_close_requested(app: &mut EffectcraftApp, ctx: &egui::Context) {
     }
 }
 
+/// On macOS a close that nothing held open quits through `-[NSApplication terminate:]` instead:
+/// closing the window while AppKit's run loop is running crashes on a Mac with a Touch Bar
+/// (#341). `on_exit` still runs. A desktop host calls it last in `logic`, after
+/// `EffectcraftApp::tick` (which runs [`on_close_requested`]) and its own work. Returns whether
+/// that quit was scheduled; other platforms close the window as before.
+pub fn quit_on_close(ctx: &egui::Context) -> bool {
+    craft_quit::on_close_request(ctx)
+}
+
 /// The project's display name: its file name, or `Untitled Project.ecproj`.
 pub fn project_name(app: &EffectcraftApp) -> String {
     app.session
@@ -72,6 +92,11 @@ pub fn window_title(app: &EffectcraftApp) -> String {
     format!("EffectCraft - {doc}{}", if app.session.is_dirty() { " *" } else { "" })
 }
 
+/// Whether the prompt is Revert Project (Revert / Cancel) instead of Unsaved Changes.
+pub(crate) fn is_revert(app: &EffectcraftApp) -> bool {
+    app.dialog_state.unsaved.command.as_ref().is_some_and(|(id, _)| id == "file.revert")
+}
+
 enum Answer {
     Save,
     Discard,
@@ -79,11 +104,11 @@ enum Answer {
 }
 
 pub fn show(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
-    let Some((id, _)) = app.dialog_state.unsaved.command.clone() else {
+    if app.dialog_state.unsaved.command.is_none() {
         app.dialog = None;
         return;
-    };
-    let revert = id == "file.revert";
+    }
+    let revert = is_revert(app);
     let name = project_name(app);
     let mut answer = None;
     let title = if revert { "Revert Project" } else { "Unsaved Changes" };
@@ -96,17 +121,18 @@ pub fn show(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
         ui.label(egui::RichText::new(text).color(t.tab_text_active));
         if !revert {
             ui.add_space(4.0);
-            ui.label(egui::RichText::new("Your changes will be lost if you don't save them.").color(t.text_dim).size(11.0));
+            ui.label(egui::RichText::new(tr("Your changes will be lost if you don't save them.")).color(t.text_dim).size(11.0));
         }
         ui.add_space(18.0);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let (label, key) = if revert { ("  Revert  ", "dialog.unsaved.revert") } else { ("   Save   ", "dialog.unsaved.save") };
-            let r = ui.add(egui::Button::new(egui::RichText::new(label).color(Color32::WHITE)).fill(t.accent));
+            // Revert discards work: red, like Delete.
+            let r = ui.add(egui::Button::new(egui::RichText::new(label).color(Color32::WHITE)).fill(if revert { t.danger } else { t.accent }));
             app.auto.add(key, r.rect, label.trim());
             if r.clicked() {
                 answer = Some(if revert { Answer::Discard } else { Answer::Save });
             }
-            let r = ui.button("Cancel");
+            let r = ui.button(tr("Cancel"));
             app.auto.add("dialog.unsaved.cancel", r.rect, "Cancel");
             if r.clicked() {
                 answer = Some(Answer::Cancel);
@@ -114,7 +140,7 @@ pub fn show(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
             if !revert {
                 // Set apart from Save, as is customary.
                 ui.add_space(ui.available_width() - 90.0);
-                let r = ui.button("Don't Save");
+                let r = ui.button(tr("Don't Save"));
                 app.auto.add("dialog.unsaved.dontSave", r.rect, "Don't Save");
                 if r.clicked() {
                     answer = Some(Answer::Discard);
@@ -124,6 +150,15 @@ pub fn show(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
     });
     if answer.is_none() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
         answer = Some(Answer::Cancel);
+    }
+    // Enter is Save, the default button; Cmd+Backspace (Ctrl elsewhere) is Don't Save, as in
+    // macOS save prompts. Revert discards work, so it takes neither: Cmd+R.
+    if answer.is_none() && !revert && super::dialogs::ui_enter(ctx) {
+        answer = Some(Answer::Save);
+    }
+    let discard = if revert { egui::Key::R } else { egui::Key::Backspace };
+    if answer.is_none() && super::dialogs::ui_command_key(ctx, discard) {
+        answer = Some(Answer::Discard);
     }
     if let Some(a) = answer {
         answer_with(app, ctx, a);
@@ -170,7 +205,7 @@ mod tests {
     fn app() -> (EffectcraftApp, egui::Context) {
         let ctx = egui::Context::default();
         let app = EffectcraftApp::new(effectcraft_engine::Session::default());
-        crate::theme::install(&ctx, &app.tokens);
+        crate::theme::install(&ctx, &app.tokens, crate::i18n::language(&app));
         (app, ctx)
     }
 
@@ -190,9 +225,44 @@ mod tests {
         out.viewport_output.get(&egui::ViewportId::ROOT).is_some_and(|v| v.commands.contains(&egui::ViewportCommand::CancelClose))
     }
 
+    /// One frame of the dialogs with the window's close button pressed, through
+    /// [`on_close_requested`] and then [`quit_on_close`] as the app runs them; returns whether the
+    /// close was canceled and whether the platform quit was scheduled.
+    fn close_frame(app: &mut EffectcraftApp, ctx: &egui::Context) -> (bool, bool) {
+        let mut raw = egui::RawInput::default();
+        raw.viewports.entry(egui::ViewportId::ROOT).or_default().events.push(egui::ViewportEvent::Close);
+        let mut quits = false;
+        let mut out = ctx.run_ui(raw, |ui| {
+            app.auto.begin_frame();
+            on_close_requested(app, ui.ctx());
+            quits = quit_on_close(ui.ctx());
+            crate::panels::dialogs::show(app, ui.ctx());
+        });
+        out.textures_delta.clear();
+        let canceled = out.viewport_output.get(&egui::ViewportId::ROOT).is_some_and(|v| v.commands.contains(&egui::ViewportCommand::CancelClose));
+        (canceled, quits)
+    }
+
     fn modified(app: &mut EffectcraftApp) {
         app.session.execute("comp.new", json!({"name": "Main", "width": 64, "height": 64})).unwrap();
         assert!(app.session.is_dirty());
+    }
+
+    #[test]
+    fn shutdown_scripts_prompt_before_discarding_unsaved_work() {
+        let (mut app, ctx) = app();
+        modified(&mut app);
+        let result = crate::menus::invoke(&mut app, &ctx, "file.runShutdownScripts", json!({})).unwrap();
+        assert_eq!(result, json!({"dialog": "unsavedChanges"}));
+        assert_eq!(app.session.project.comps().count(), 1);
+        assert!(app.session.is_dirty());
+        answer_with(&mut app, &ctx, Answer::Cancel);
+        assert_eq!(app.session.project.comps().count(), 1);
+        assert!(app.session.is_dirty());
+        crate::menus::invoke(&mut app, &ctx, "file.runShutdownScripts", json!({})).unwrap();
+        answer_with(&mut app, &ctx, Answer::Discard);
+        assert_eq!(app.session.project.comps().count(), 0);
+        assert!(!app.session.is_dirty() && app.dialog.is_none());
     }
 
     #[test]
@@ -224,6 +294,59 @@ mod tests {
         modified(&mut app);
         app.session.execute("file.closeProject", json!({})).unwrap();
         assert!(app.dialog.is_none() && app.session.project.comps().count() == 0);
+    }
+
+    #[test]
+    fn cmd_backspace_is_dont_save_but_not_revert() {
+        let press = |app: &mut EffectcraftApp, ctx: &egui::Context| crate::panels::dialogs::press_key(app, ctx, egui::Key::Backspace, egui::Modifiers::COMMAND);
+        let (mut app, ctx) = app();
+        modified(&mut app);
+        crate::menus::invoke(&mut app, &ctx, "file.newProject", json!({})).unwrap();
+        assert_eq!(app.dialog, Some(Dialog::UnsavedChanges));
+        press(&mut app, &ctx);
+        assert!(app.dialog.is_none() && !app.session.is_dirty());
+        assert_eq!(app.session.project.comps().count(), 0, "closed without saving");
+        // The Revert prompt has no Don't Save.
+        let dir = std::env::temp_dir().join(format!("ec-unsaved-key-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        modified(&mut app);
+        app.session.execute("file.saveAs", json!({"path": dir.join("Kept.ecproj").to_string_lossy()})).unwrap();
+        app.session.execute("layer.newNull", json!({})).unwrap();
+        crate::menus::invoke(&mut app, &ctx, "file.revert", json!({})).unwrap();
+        press(&mut app, &ctx);
+        assert_eq!(app.dialog, Some(Dialog::UnsavedChanges));
+        assert_eq!(app.session.active_comp().unwrap().layers.len(), 1, "not reverted");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn enter_is_save_and_cmd_r_is_revert() {
+        let press = |app: &mut EffectcraftApp, ctx: &egui::Context| crate::panels::dialogs::press_key(app, ctx, egui::Key::Enter, egui::Modifiers::NONE);
+        let (mut app, ctx) = app();
+        let dir = std::env::temp_dir().join(format!("ec-unsaved-enter-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Kept.ecproj");
+        modified(&mut app);
+        app.session.execute("file.saveAs", json!({"path": path.to_string_lossy()})).unwrap();
+        // The Revert prompt discards work: Enter leaves it open.
+        app.session.execute("layer.newNull", json!({})).unwrap();
+        crate::menus::invoke(&mut app, &ctx, "file.revert", json!({})).unwrap();
+        press(&mut app, &ctx);
+        assert_eq!(app.dialog, Some(Dialog::UnsavedChanges));
+        assert_eq!(app.session.active_comp().unwrap().layers.len(), 1, "not reverted");
+        // Cmd+R is Revert.
+        crate::panels::dialogs::press_key(&mut app, &ctx, egui::Key::R, egui::Modifiers::COMMAND);
+        assert!(app.dialog.is_none());
+        assert_eq!(app.session.active_comp().unwrap().layers.len(), 0, "reverted");
+        app.session.execute("layer.newNull", json!({})).unwrap();
+        // Save: the change is written, then the project closes.
+        crate::menus::invoke(&mut app, &ctx, "file.closeProject", json!({})).unwrap();
+        press(&mut app, &ctx);
+        assert!(app.dialog.is_none());
+        assert_eq!(app.session.project.comps().count(), 0, "closed");
+        app.session.execute("file.open", json!({"path": path.to_string_lossy()})).unwrap();
+        assert_eq!(app.session.active_comp().unwrap().layers.len(), 1, "the null was saved");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -269,5 +392,82 @@ mod tests {
         app.session.execute("edit.undo", json!({})).unwrap();
         assert!(!app.session.is_dirty());
         assert!(!frame(&mut app, &ctx, true));
+    }
+
+    /// Closing the window while AppKit's run loop is running crashes on a Mac with a Touch Bar
+    /// (#341). On macOS the close is canceled and the app quits through
+    /// `-[NSApplication terminate:]`. Other platforms close the window.
+    #[test]
+    fn closing_a_saved_project_quits_through_the_platform_on_macos() {
+        let (mut app, ctx) = app();
+        let macos = cfg!(target_os = "macos");
+        assert_eq!(close_frame(&mut app, &ctx), (macos, macos));
+        assert!(app.dialog.is_none(), "nothing to ask");
+    }
+
+    #[test]
+    fn closing_a_modified_project_asks_before_the_platform_quit() {
+        let (mut app, ctx) = app();
+        modified(&mut app);
+        assert_eq!(close_frame(&mut app, &ctx), (true, false), "the prompt holds the window and nothing quits");
+        assert_eq!(app.dialog, Some(Dialog::UnsavedChanges));
+        answer_with(&mut app, &ctx, Answer::Cancel);
+        assert!(app.session.is_dirty() && !app.dialog_state.unsaved.quitting);
+        assert_eq!(close_frame(&mut app, &ctx), (true, false), "asked again after Cancel");
+        answer_with(&mut app, &ctx, Answer::Discard);
+        let macos = cfg!(target_os = "macos");
+        assert_eq!(close_frame(&mut app, &ctx), (macos, macos), "Don't Save quits");
+    }
+
+    /// While the window is minimized or hidden, eframe runs `App::logic` without `App::ui` and
+    /// still handles a close: `logic` asks about a modified project.
+    #[test]
+    fn a_close_while_only_logic_runs_asks_about_a_modified_project() {
+        let (mut app, ctx) = app();
+        modified(&mut app);
+        let mut raw = egui::RawInput::default();
+        raw.viewports.entry(egui::ViewportId::ROOT).or_default().events.push(egui::ViewportEvent::Close);
+        let mut frame = eframe::Frame::_new_kittest();
+        let out = ctx.run_logic(&raw, |ctx| eframe::App::logic(&mut app, ctx, &mut frame));
+        let canceled = out.viewport_commands.get(&egui::ViewportId::ROOT).is_some_and(|c| c.contains(&egui::ViewportCommand::CancelClose));
+        assert!(canceled, "the close is canceled");
+        assert_eq!(app.dialog, Some(Dialog::UnsavedChanges));
+    }
+
+    /// A file dialog answered in the frame that closes the window runs its command before the
+    /// close decision, so a change it makes is asked about.
+    #[test]
+    fn a_dialog_answer_runs_before_the_close_decision() {
+        let (mut app, ctx) = app();
+        assert!(!app.session.is_dirty());
+        let answer = crate::DialogAnswer { command: "comp.new".into(), key: "name", params: json!({"width": 64, "height": 64}), paths: vec!["Main".into()] };
+        app.dialog_answers.0.send(answer).unwrap();
+        let mut raw = egui::RawInput::default();
+        raw.viewports.entry(egui::ViewportId::ROOT).or_default().events.push(egui::ViewportEvent::Close);
+        let mut frame = eframe::Frame::_new_kittest();
+        let out = ctx.run_logic(&raw, |ctx| eframe::App::logic(&mut app, ctx, &mut frame));
+        let canceled = out.viewport_commands.get(&egui::ViewportId::ROOT).is_some_and(|c| c.contains(&egui::ViewportCommand::CancelClose));
+        assert!(app.session.is_dirty(), "the answer ran");
+        assert!(canceled, "the close is canceled");
+        assert_eq!(app.dialog, Some(Dialog::UnsavedChanges));
+    }
+
+    /// The tick makes the close decision and leaves the platform quit to the host, which runs it
+    /// last in `logic`, after its own work (the desktop host shows the file dialogs asked for).
+    /// On macOS `logic` cancels the close and quits; other platforms close the window.
+    #[test]
+    fn the_platform_quit_runs_after_the_tick() {
+        let (mut app, ctx) = app();
+        let mut raw = egui::RawInput::default();
+        raw.viewports.entry(egui::ViewportId::ROOT).or_default().events.push(egui::ViewportEvent::Close);
+        let frame = eframe::Frame::_new_kittest();
+        let canceled =
+            |out: &egui::LogicOutput| out.viewport_commands.get(&egui::ViewportId::ROOT).is_some_and(|c| c.contains(&egui::ViewportCommand::CancelClose));
+        let out = ctx.run_logic(&raw, |ctx| app.tick(ctx, &frame));
+        assert!(!canceled(&out), "the tick leaves a saved project's close to the host");
+        let mut frame = eframe::Frame::_new_kittest();
+        let out = ctx.run_logic(&raw, |ctx| eframe::App::logic(&mut app, ctx, &mut frame));
+        assert_eq!(canceled(&out), cfg!(target_os = "macos"), "logic quits through the platform on macOS");
+        assert!(app.dialog.is_none(), "nothing to ask");
     }
 }

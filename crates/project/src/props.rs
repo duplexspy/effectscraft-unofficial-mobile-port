@@ -37,6 +37,11 @@ pub enum ParamUi {
     Mask,
     Path,
     Text,
+    /// A file path (a string value) chosen with a "Choose…" button, offering files with these
+    /// extensions: Apply Color LUT's LUT, an OCIO config.
+    File {
+        filters: Vec<String>,
+    },
     Gradient,
     /// Not shown in Effect Controls / the timeline (internal data).
     Hidden,
@@ -122,6 +127,13 @@ impl Property {
         if self.keys.is_empty() {
             return self.value.clone();
         }
+        // 3D Orientation turns along the shortest arc between its keys, as in After Effects.
+        // Routed by `match_id`: "orientation" is only used by the Orientation property of 3D
+        // layers, cameras and lights (`build.rs`), always a `Vec3` of degrees. A future property
+        // must not reuse that id unless it is a rotation that should slerp the same way.
+        if self.match_id == "orientation" && matches!(self.value, Value::Vec3(_)) {
+            return effectcraft_keyframe::evaluate_orientation(&self.keys, t).unwrap_or_else(|| self.value.clone());
+        }
         effectcraft_keyframe::evaluate(&self.keys, t, self.spatial).unwrap_or_else(|| self.value.clone())
     }
     /// Set the value at `t`: adds/replaces a key when animated, else sets the static value.
@@ -200,7 +212,8 @@ pub enum MaskMotionBlur {
     Off,
 }
 
-/// How a mask's feather ramps: Smooth (Gaussian) or Linear.
+/// How a mask's feather ramps: Smooth (three box passes, an S-shaped ramp of finite reach, as
+/// measured in After Effects) or Linear (one box pass: a straight ramp).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum FeatherFalloff {
     #[default]
@@ -250,6 +263,10 @@ pub struct PropGroup {
     /// fx switch for effects, eye for shape groups, etc.
     #[serde(default = "yes")]
     pub enabled: bool,
+    /// An effect's colour label (After Effects 26.5), shown in Effect Controls and the Timeline;
+    /// `None` is unlabelled. Absent in older projects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<effectcraft_color::Label>,
     #[serde(default)]
     pub children: Vec<Node>,
 }
@@ -332,8 +349,14 @@ pub fn parse_path(s: &str) -> Vec<Seg> {
 }
 
 impl PropGroup {
+    /// An instance in an indexed list (effect, mask, shape item, text animator, tracker): these
+    /// can be renamed, removed, duplicated and reordered; fixed groups (Transform…) can't.
+    pub fn is_instance(&self) -> bool {
+        matches!(self.kind, GroupKind::Indexed | GroupKind::Effect { .. } | GroupKind::Mask { .. } | GroupKind::Tracker { .. })
+    }
+
     pub fn new(uid: Uid, match_id: &str, name: &str) -> PropGroup {
-        PropGroup { uid, match_id: match_id.into(), name: name.into(), kind: GroupKind::Plain, enabled: true, children: vec![] }
+        PropGroup { uid, match_id: match_id.into(), name: name.into(), kind: GroupKind::Plain, enabled: true, label: None, children: vec![] }
     }
     pub fn with(mut self, n: impl Into<Node>) -> PropGroup {
         self.children.push(n.into());

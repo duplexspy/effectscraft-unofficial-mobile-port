@@ -16,6 +16,11 @@ const PRELUDE: &str = include_str!("prelude.js");
 /// Message of the error thrown when a request isn't answered yet (never shown to users).
 const PENDING: &str = "\u{1}effectcraft: pending host request";
 const MAX_SCRIPTS: usize = 4096;
+/// Loop iterations one script run may make (per function call): a run re-executes once per
+/// property it reads, so this bounds the time of every pass.
+pub const LOOP_LIMIT: u64 = 1_000_000;
+/// The error of an evaluation that ran out of time.
+pub const TIMED_OUT: &str = "Error: expression takes too long to evaluate";
 /// The part of boa's stack-size limit error the runtime recovers from (see [`run`]).
 const STACK_LIMIT: &str = "maximum stack size";
 
@@ -24,6 +29,18 @@ const STACK_LIMIT: &str = "maximum stack size";
 pub struct Frame {
     pub memo: HashMap<Req, Resp>,
     pub misses: Vec<Req>,
+    /// What this frame evaluates: an evaluation that needs itself is a cycle.
+    pub owner: Option<Owner>,
+}
+
+/// One expression evaluation: the property (comp, layer, uid), the comp time and the text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Owner {
+    pub comp: u64,
+    pub layer: u64,
+    pub uid: u64,
+    pub time: effectcraft_time::Tick,
+    pub text: String,
 }
 
 thread_local! {
@@ -32,6 +49,16 @@ thread_local! {
     static RUNTIME: RefCell<Option<ManuallyDrop<Result<Runtime, String>>>> = const { RefCell::new(None) };
     /// Evaluation stack (nested when one expression reads another's value).
     pub static FRAMES: RefCell<Vec<Frame>> = const { RefCell::new(Vec::new()) };
+    /// Script runs since the outermost evaluation on this thread began (nested ones included).
+    pub static RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Stack address where the current script run began (0: none; see [`native_stack`]).
+    static STACK_BASE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+thread_local! {
+    /// When the outermost evaluation on this thread began.
+    pub static STARTED: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
 }
 
 struct Runtime {
@@ -160,6 +187,8 @@ fn native_host(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsV
             t: secs(num(args, 8, ctx)?),
         },
         14 => Req::Project,
+        15 => Req::SourceInfo { comp: id(args, 1, ctx)?, layer: id(args, 2, ctx)? },
+        16 => Req::Ancestor { comp: id(args, 1, ctx)?, layer: id(args, 2, ctx)?, path: string(args, 3, ctx)?, up: num(args, 4, ctx)? as i64 },
         _ => return Err(JsNativeError::typ().with_message("unknown host request").into()),
     };
     let found = FRAMES.with(|f| {
@@ -205,17 +234,54 @@ fn native_random(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<J
     Ok(JsValue::from(noise::unit(noise::mix(&parts))))
 }
 
+/// Stack a script run may use below [`run`] for natives that recurse once per level of a nested
+/// value (`join`, `JSON.stringify`, …; the prelude calls [`native_stack`] per level). It is the
+/// same on every thread, so a value converts or fails alike in preview, export and commands.
+/// Expressions run on render, export and diagnostics threads (2 MiB, std and rayon's default)
+/// and on the main thread for commands and syntax checks (1 MiB on Windows). A debug build
+/// stops the nested-value tests within a fresh 512 KiB thread, which leaves the main thread
+/// 512 KiB for its callers. The parser's limit ([`crate::rewrite::MAX_NESTING`]) is the tighter
+/// one there: 30 levels need about 1 MiB in debug builds. On wasm32 the address of a local is on
+/// the shadow stack, not the engine's call stack, so this measures nothing useful there.
+const NATIVE_STACK: usize = 256 << 10;
+
+/// An address on the current stack (on wasm32, the shadow stack).
+fn stack_here() -> usize {
+    let marker = 0u8;
+    std::hint::black_box(&marker) as *const u8 as usize
+}
+
+/// `__stack()`: throw once the current run has used [`NATIVE_STACK`] (values nested so deeply
+/// would overflow the stack, which aborts the app).
+fn native_stack(_: &JsValue, _: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
+    let base = STACK_BASE.with(|b| b.get());
+    if base != 0 && base.abs_diff(stack_here()) > NATIVE_STACK {
+        return Err(JsNativeError::range().with_message("value is nested too deeply").into());
+    }
+    Ok(JsValue::undefined())
+}
+
+/// `__nest(src)`: throw when source handed to `eval` / `Function` at run time nests deeper than
+/// the parser's stack allows (the expression text itself is checked before it is compiled).
+fn native_nesting(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let src = string(args, 0, ctx)?;
+    crate::rewrite::check_plain_nesting(&src).map_err(|e| JsNativeError::range().with_message(e.trim_start_matches("Error: ").to_string()))?;
+    Ok(JsValue::undefined())
+}
+
 impl Runtime {
     fn new() -> Result<Runtime, String> {
         let mut ctx = Context::default();
         let limits = ctx.runtime_limits_mut();
-        limits.set_loop_iteration_limit(10_000_000);
+        limits.set_loop_iteration_limit(LOOP_LIMIT);
         limits.set_recursion_limit(400);
-        let natives: [(JsString, usize, fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>); 4] = [
+        let natives: [(JsString, usize, fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>); 6] = [
+            (js_string!("__stack"), 0, native_stack),
             (js_string!("__h"), 6, native_host),
             (js_string!("__wig"), 8, native_wiggle),
             (js_string!("__noise"), 3, native_noise),
             (js_string!("__rnd"), 6, native_random),
+            (js_string!("__nest"), 1, native_nesting),
         ];
         for (name, len, f) in natives {
             ctx.register_global_callable(name, len, NativeFunction::from_fn_ptr(f)).map_err(|e| e.to_string())?;
@@ -270,7 +336,11 @@ impl Runtime {
         if let Err(e) = self.begin.call(&JsValue::undefined(), &args, ctx) {
             return Run::Done(Err(format_error(&e.to_string(), line_count(text))));
         }
-        let result = script.evaluate(ctx).and_then(|v| self.finish.call(&JsValue::undefined(), &[v], ctx));
+        let result = match evaluate_in_time(&script, ctx) {
+            Some(r) => r.and_then(|v| self.finish.call(&JsValue::undefined(), &[v], ctx)),
+            // Abandoned mid-run: the context is unusable now (see `run`).
+            None => return Run::Done(Err(TIMED_OUT.into())),
+        };
         let pending = FRAMES.with(|f| f.borrow().last().is_some_and(|fr| !fr.misses.is_empty()));
         if pending {
             return Run::Pending;
@@ -281,6 +351,57 @@ impl Runtime {
         })
     }
 }
+
+/// Run `script`, giving up (`None`) once the outermost evaluation is out of time
+/// ([`crate::MAX_TIME`]). boa's budgeted evaluation yields every few thousand instructions of
+/// the script and the functions it calls (not inside callbacks of native functions such as
+/// `Array.prototype.map`, which stay bounded by the loop limit per call).
+fn evaluate_in_time(script: &Script, ctx: &mut Context) -> Option<JsResult<JsValue>> {
+    let mut run = std::pin::pin!(script.evaluate_async_with_budget(ctx, 20_000));
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    loop {
+        if let std::task::Poll::Ready(r) = run.as_mut().poll(&mut cx) {
+            return Some(r);
+        }
+        if out_of_time() {
+            return None;
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: this thread's time budget (tests of the run-count budget lift it so that a
+    /// loaded machine cannot reach the clock first).
+    pub static TIME_LIMIT: std::cell::Cell<std::time::Duration> = const { std::cell::Cell::new(crate::MAX_TIME) };
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn max_time() -> std::time::Duration {
+    #[cfg(test)]
+    {
+        TIME_LIMIT.with(|t| t.get())
+    }
+    #[cfg(not(test))]
+    {
+        crate::MAX_TIME
+    }
+}
+
+/// Whether the outermost evaluation on this thread has used up [`crate::MAX_TIME`].
+pub fn out_of_time() -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        STARTED.with(|s| s.get()).is_some_and(|t| t.elapsed() > max_time())
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        false
+    }
+}
+
+/// Levels of nested arrays a script result keeps.
+const MAX_DETACH: usize = 4;
 
 /// Copy a JS value out of the heap.
 fn detach(v: &JsValue, ctx: &mut Context, depth: usize) -> Result<Out, String> {
@@ -301,7 +422,7 @@ fn detach(v: &JsValue, ctx: &mut Context, depth: usize) -> Result<Out, String> {
     }
     let err = |e: boa_engine::JsError| format_error(&e.to_string(), usize::MAX);
     if let Some(o) = v.as_object() {
-        if o.is_array() && depth < 4 {
+        if o.is_array() && depth < MAX_DETACH {
             let arr = JsArray::from_object(o).map_err(err)?;
             let n = arr.length(ctx).map_err(err)?.min(1 << 16);
             let mut out = Vec::with_capacity(n as usize);
@@ -328,6 +449,11 @@ fn detach(v: &JsValue, ctx: &mut Context, depth: usize) -> Result<Out, String> {
             let closed = o.get(js_string!("__closed"), ctx).map_err(err)?.to_boolean();
             return Ok(Out::Path { points, ins, outs, closed });
         }
+    }
+    // Below the levels detached above, an object's text could be its whole nested content
+    // (`String([[[…]]])`), converted by natives that recurse once per level.
+    if depth >= MAX_DETACH && v.is_object() {
+        return Ok(Out::Object("[object]".into()));
     }
     Ok(Out::Object(v.to_string(ctx).map(|s| s.to_std_string_escaped()).unwrap_or_default()))
 }
@@ -405,6 +531,8 @@ fn position_line(msg: &str) -> Option<usize> {
 /// `__begin` with memoized answers, so nothing carries over. A script that really overflows the
 /// stack fails again on the fresh context and reports the error.
 pub fn run(text: &str, b: &Begin) -> Run {
+    // Runs don't nest (other expressions are evaluated between runs), so one base suffices.
+    STACK_BASE.with(|s| s.set(stack_here()));
     RUNTIME.with(|r| {
         let mut r = r.borrow_mut();
         for fresh in [false, true] {
@@ -413,6 +541,13 @@ pub fn run(text: &str, b: &Begin) -> Run {
                 Err(e) => return Run::Done(Err(e.clone())),
             };
             match out {
+                Run::Done(Err(e)) if e == TIMED_OUT => {
+                    // Abandoned mid-run: start the next evaluation on a fresh context.
+                    if let Some(old) = r.take() {
+                        drop(ManuallyDrop::into_inner(old));
+                    }
+                    return Run::Done(Err(e));
+                }
                 Run::Done(Err(e)) if !fresh && e.contains(STACK_LIMIT) => {
                     // Dropped here, mid-thread, where boa's heap is alive (unlike at thread exit).
                     if let Some(old) = r.take() {
@@ -500,6 +635,11 @@ pub fn to_value(out: &Out, current: &Value) -> Result<Value, String> {
         Value::Str(_) => Value::Str(text(out)),
         Value::Path(_) => match out {
             Out::Path { points, ins, outs, closed } => {
+                // A vertex that isn't a number (`[[0, 0], [[1, 2], 0]]`) comes through as NaN, which
+                // the rasterizer must never see.
+                if points.iter().chain(ins).chain(outs).flatten().any(|c| !c.is_finite()) {
+                    return Err("Error: path points must be finite numbers".into());
+                }
                 let n = points.len();
                 let fit = |v: &[[f64; 2]]| {
                     let mut v = v.to_vec();
@@ -537,6 +677,7 @@ pub fn styled_doc(v: &serde_json::Value, own: &effectcraft_keyframe::TextDoc) ->
             let p0 = src.para(0);
             d.set_paras(vec![p0; d.para_count()]);
             d.stroke_over_fill = src.stroke_over_fill;
+            d.line_join = src.line_join;
         }
     }
     for op in v.get("ops").and_then(|o| o.as_array()).into_iter().flatten() {

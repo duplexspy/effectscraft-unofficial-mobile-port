@@ -6,6 +6,10 @@ use effectcraft_color::{luminance, rgb_to_hsl};
 use effectcraft_raster::{Image, Px};
 use rayon::prelude::*;
 
+/// Below this many pixels, `Plane::transpose` and `Plane::map_rows` run on the calling thread:
+/// the rayon dispatch costs more than the work on small crops (the Match Grain sample boxes).
+const PAR_MIN: usize = 4096;
+
 /// A single-channel `f32` image (row-major).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Plane {
@@ -62,6 +66,15 @@ impl Plane {
     pub fn transpose(&self) -> Plane {
         let (w, h) = (self.w, self.h);
         let mut out = Plane::new(h, w);
+        if w.saturating_mul(h) < PAR_MIN {
+            // Small planes: the rayon dispatch costs more than the copy itself.
+            for (x, col) in out.data.chunks_mut(h.max(1)).enumerate() {
+                for y in 0..h {
+                    col[y] = self.data[y * w + x];
+                }
+            }
+            return out;
+        }
         out.data.par_chunks_mut(h.max(1)).enumerate().for_each(|(x, col)| {
             for y in 0..h {
                 col[y] = self.data[y * w + x];
@@ -73,6 +86,11 @@ impl Plane {
     pub fn map_rows(&self, f: impl Fn(&[f32], &mut [f32]) + Sync) -> Plane {
         let mut out = Plane::new(self.w, self.h);
         if self.w == 0 {
+            return out;
+        }
+        if self.w.saturating_mul(self.h) < PAR_MIN {
+            // Small planes: the rayon dispatch costs more than the rows themselves.
+            out.data.chunks_mut(self.w).zip(self.data.chunks(self.w)).for_each(|(o, s)| f(s, o));
             return out;
         }
         out.data.par_chunks_mut(self.w).zip(self.data.par_chunks(self.w)).for_each(|(o, s)| f(s, o));
@@ -424,16 +442,24 @@ pub fn remap(src: &Image, clamp: bool, f: impl Fn(f64, f64) -> Option<(f64, f64)
 
 /// Layer rectangle in buffer pixels: (x0, y0, width, height).
 pub fn layer_rect(ctx: &crate::EffectCtx, b: &crate::Buf) -> (f64, f64, f64, f64) {
-    (b.offset[0], b.offset[1], ctx.layer_size[0] * b.scale, ctx.layer_size[1] * b.scale)
+    layer_rect_at(ctx, b.offset, b.scale)
 }
 
-/// The layer bounds edge pinning holds in place, in the pixels of a buffer with `offset` and
-/// `scale` (see [`crate::Buf`]): (x0, y0, width, height). Unlike [`layer_rect`] it starts at
-/// [`crate::EffectEnv::bounds_origin`], so a shape layer's content around its origin lies
-/// inside it.
-pub fn pin_rect(ctx: &crate::EffectCtx, offset: [f64; 2], scale: f64) -> (f64, f64, f64, f64) {
-    let o = ctx.env.bounds_origin;
-    (offset[0] + o[0] * scale, offset[1] + o[1] * scale, ctx.layer_size[0] * scale, ctx.layer_size[1] * scale)
+/// [`layer_rect`] in the pixels of a buffer with `offset` and `scale` (see [`crate::Buf`];
+/// GPU buffers): the layer bounds start at effect-space (0, 0).
+pub fn layer_rect_at(ctx: &crate::EffectCtx, offset: [f64; 2], scale: f64) -> (f64, f64, f64, f64) {
+    (offset[0], offset[1], ctx.layer_size[0] * scale, ctx.layer_size[1] * scale)
+}
+
+/// Transparent pixels to add on every side ([`crate::Buf::pad`]) of a buffer `size` pixels big,
+/// with `offset` and `scale`, so it covers the whole layer rectangle (at most 4096). A text or
+/// shape layer's buffer only surrounds its content, but its layer bounds are comp-sized (see
+/// the renderer's `effect_bounds`): an effect that fills the layer, such as CC Tiler, fills
+/// those as in After Effects (#659).
+pub fn layer_cover_pad(ctx: &crate::EffectCtx, size: [u32; 2], offset: [f64; 2], scale: f64) -> u32 {
+    let (x0, y0, w, h) = layer_rect_at(ctx, offset, scale);
+    let need = [-x0, -y0, x0 + w - f64::from(size[0]), y0 + h - f64::from(size[1])].into_iter().fold(0.0, f64::max);
+    need.ceil().min(4096.0) as u32
 }
 
 /// Resample another layer (a layer parameter) into `b`'s pixel grid. With `stretch` the other
@@ -453,6 +479,17 @@ pub fn fit_layer(ctx: &crate::EffectCtx, b: &crate::Buf, other: &crate::LayerPix
     })
 }
 
+/// Resample a buffer into another buffer's pixel grid without stretching its layer space.
+/// Used to composite the pre-effect image after earlier effects expand or shift the bounds.
+pub fn fit_buffer(source: &crate::Buf, width: u32, height: u32, offset: [f64; 2], scale: f64) -> Image {
+    let inv = 1.0 / scale.max(1e-9);
+    gen_image(width, height, |x, y| {
+        let sx = (x as f64 + 0.5 - offset[0]) * inv * source.scale + source.offset[0];
+        let sy = (y as f64 + 0.5 - offset[1]) * inv * source.scale + source.offset[1];
+        source.img.sample_bilinear(sx, sy)
+    })
+}
+
 /// The layer chosen in layer parameter `id` fitted to `b` (see [`fit_layer`]), or a copy of
 /// `b`'s own pixels when none is chosen / available (After Effects' "self" behaviour).
 pub fn layer_or_self(ctx: &crate::EffectCtx, b: &crate::Buf, id: &str, masks_and_effects: bool, stretch: bool) -> Image {
@@ -465,9 +502,15 @@ pub fn layer_or_self(ctx: &crate::EffectCtx, b: &crate::Buf, id: &str, masks_and
 /// A stable hash of an effect instance's evaluated parameters, seed, layer size and buffer
 /// scale (cache key for simulations).
 pub fn params_key(ctx: &crate::EffectCtx, b: &crate::Buf, salt: u64) -> u64 {
+    params_key_except(ctx, b, salt, &[])
+}
+
+/// [`params_key`] without the parameters whose ids start with one of `skip` (ones that only
+/// change how the simulation is viewed, so animating them doesn't restart it).
+pub fn params_key_except(ctx: &crate::EffectCtx, b: &crate::Buf, salt: u64, skip: &[&str]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    let mut keys: Vec<&String> = ctx.params.values.keys().collect();
+    let mut keys: Vec<&String> = ctx.params.values.keys().filter(|k| !skip.iter().any(|s| k.starts_with(s))).collect();
     keys.sort();
     for k in keys {
         k.hash(&mut h);
@@ -509,14 +552,29 @@ impl<S: Clone> SimCache<S> {
 
     /// State after `target` steps. `init` builds step 0; `step(state, i)` advances from step
     /// `i` to `i + 1`.
-    pub fn run(&self, key: u64, target: u64, init: impl FnOnce() -> S, mut step: impl FnMut(&mut S, u64)) -> std::sync::Arc<S> {
+    pub fn run(&self, key: u64, target: u64, init: impl FnOnce() -> S, step: impl FnMut(&mut S, u64)) -> std::sync::Arc<S> {
+        self.run_where(key, target, init, step, |_, _| true)
+    }
+
+    /// [`SimCache::run`] for a simulation whose steps also depend on inputs outside `key` (a
+    /// parameter's values over time): a checkpoint after `s` steps is only resumed from when
+    /// `valid(s, state)` says it was reached with the same inputs. Fresh checkpoints replace
+    /// those at the same step.
+    pub fn run_where(
+        &self,
+        key: u64,
+        target: u64,
+        init: impl FnOnce() -> S,
+        mut step: impl FnMut(&mut S, u64),
+        valid: impl Fn(u64, &S) -> bool,
+    ) -> std::sync::Arc<S> {
         use std::sync::Arc;
         let start = {
-            let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let tick = g.iter().map(|e| e.used).max().unwrap_or(0) + 1;
             g.iter_mut().find(|e| e.key == key).and_then(|e| {
                 e.used = tick;
-                e.checkpoints.iter().filter(|(s, _)| *s <= target).max_by_key(|(s, _)| *s).map(|(s, st)| (*s, st.clone()))
+                e.checkpoints.iter().filter(|(s, st)| *s <= target && valid(*s, st)).max_by_key(|(s, _)| *s).map(|(s, st)| (*s, st.clone()))
             })
         };
         let had_start = start.is_some();
@@ -538,7 +596,7 @@ impl<S: Clone> SimCache<S> {
         }
         let out = Arc::new(st);
         fresh.push((target, out.clone()));
-        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let tick = g.iter().map(|e| e.used).max().unwrap_or(0) + 1;
         let idx = match g.iter().position(|e| e.key == key) {
             Some(ix) => ix,
@@ -554,9 +612,8 @@ impl<S: Clone> SimCache<S> {
         let e = &mut g[idx];
         e.used = tick;
         for (s, st) in fresh {
-            if !e.checkpoints.iter().any(|(c, _)| *c == s) {
-                e.checkpoints.push((s, st));
-            }
+            e.checkpoints.retain(|(c, _)| *c != s);
+            e.checkpoints.push((s, st));
         }
         // Keep memory bounded: drop unaligned (exact-target) checkpoints first, then thin.
         if e.checkpoints.len() > 256 {

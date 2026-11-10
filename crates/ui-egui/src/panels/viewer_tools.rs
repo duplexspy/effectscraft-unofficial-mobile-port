@@ -24,8 +24,9 @@ use crate::{EffectcraftApp, widgets};
 pub(crate) const SNAP_PX: f64 = 8.0;
 const SNAP_COLOR: Color32 = Color32::from_rgb(0xff, 0xd2, 0x3c);
 
+/// The `egui::Id` under which this frame's snap feedback is stored until `draw_snap` consumes it.
 fn snap_id() -> egui::Id {
-    egui::Id::new("viewer-snap")
+    egui::Id::unique("viewer-snap")
 }
 
 /// Layer snapping is on: the Snapping checkbox (View ▸ Snapping), inverted while Cmd/Ctrl is held.
@@ -47,20 +48,21 @@ pub(crate) fn snap(
     sources: &[[f64; 2]],
     mods: egui::Modifiers,
 ) -> [f64; 2] {
-    snap_with(app, ctx, ectx, map, exclude, sources, mods, &[])
+    snap_with(app, ctx, ectx, map, &SnapQuery { exclude, sources, mods, extra: &[] })
 }
 
-/// [`snap`] with `extra` layer targets (the Pan Behind layer's own box).
-pub(crate) fn snap_with(
-    app: &EffectcraftApp,
-    ctx: &egui::Context,
-    ectx: &EvalCtx,
-    map: &ViewerMap,
-    exclude: &[LayerId],
-    sources: &[[f64; 2]],
-    mods: egui::Modifiers,
-    extra: &[vw::SnapTarget],
-) -> [f64; 2] {
+/// What [`snap_with`] snaps: the dragged features and the layers to ignore, plus `extra` layer
+/// targets (the Pan Behind layer's own box).
+pub(crate) struct SnapQuery<'a> {
+    pub exclude: &'a [LayerId],
+    pub sources: &'a [[f64; 2]],
+    pub mods: egui::Modifiers,
+    pub extra: &'a [vw::SnapTarget],
+}
+
+/// [`snap`] with extra layer targets.
+pub(crate) fn snap_with(app: &EffectcraftApp, ctx: &egui::Context, ectx: &EvalCtx, map: &ViewerMap, q: &SnapQuery) -> [f64; 2] {
+    let SnapQuery { exclude, sources, mods, extra } = *q;
     let layers = snapping_on(app, mods);
     let v = &app.ui.viewer;
     let guides = v.snap_guides && v.guides;
@@ -225,10 +227,11 @@ pub(crate) fn rulers(app: &mut EffectcraftApp, ui: &mut egui::Ui, map: &ViewerMa
     // Zero point: drag the corner, double-click to reset.
     p.line_segment([corner.center() - vec2(4.0, 0.0), corner.center() + vec2(4.0, 0.0)], tick);
     p.line_segment([corner.center() - vec2(0.0, 4.0), corner.center() + vec2(0.0, 4.0)], tick);
-    let cr =
-        ui.interact(corner, egui::Id::new("vw-ruler-origin"), Sense::click_and_drag()).on_hover_text("Ruler zero point (drag to move, double-click to reset)");
+    let cr = ui
+        .interact(corner, egui::Id::unique("vw-ruler-origin"), Sense::click_and_drag())
+        .on_hover_text(crate::i18n::tr("Ruler zero point (drag to move, double-click to reset)"));
     app.auto.add("viewer.ruler.origin", corner, "Ruler zero point");
-    let fg = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("vw-ruler-fg")));
+    let fg = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("vw-ruler-fg")));
     if cr.dragged()
         && let Some(hp) = cr.interact_pointer_pos()
     {
@@ -247,7 +250,7 @@ pub(crate) fn rulers(app: &mut EffectcraftApp, ui: &mut egui::Ui, map: &ViewerMa
     // Guides dragged out of the rulers: the top ruler makes horizontal guides, the left one
     // vertical guides.
     for (r, vertical, id) in [(top, false, "top"), (left, true, "left")] {
-        let resp = ui.interact(r, egui::Id::new(("vw-ruler", id)), Sense::drag()).on_hover_text("Drag to create a guide");
+        let resp = ui.interact(r, egui::Id::unique(("vw-ruler", id)), Sense::drag()).on_hover_text(crate::i18n::tr("Drag to create a guide"));
         app.auto.add(&format!("viewer.ruler.{id}"), r, if vertical { "Vertical ruler" } else { "Horizontal ruler" });
         if resp.hovered() {
             ui.ctx().set_cursor_icon(if vertical { egui::CursorIcon::ResizeHorizontal } else { egui::CursorIcon::ResizeVertical });
@@ -288,7 +291,8 @@ pub(crate) fn guide_at(app: &EffectcraftApp, comp: &Comp, map: &ViewerMap, pos: 
         return None;
     }
     comp.guides.iter().enumerate().find_map(|(i, g)| {
-        let s = map.to_screen([g.position, g.position]);
+        let px = g.px(comp.width, comp.height);
+        let s = map.to_screen([px, px]);
         let d = if g.vertical { (s.x - pos.x).abs() } else { (s.y - pos.y).abs() };
         (d < 4.0).then_some((i, g.vertical))
     })
@@ -316,13 +320,21 @@ pub(crate) fn proportional_grid(app: &EffectcraftApp, painter: &egui::Painter, c
 
 // ---------------------------------------------------------------- the displayed frame
 
-/// Remember the region of interest the displayed texture was rendered with.
+/// Store the displayed texture's Region of Interest or Extended Viewer area unchanged.
 pub(crate) fn set_texture_roi(ctx: &egui::Context, roi: Option<[f64; 4]>) {
-    ctx.data_mut(|d| d.insert_temp(egui::Id::new("viewer-tex-roi"), roi));
+    ctx.data_mut(|d| d.insert_temp(egui::Id::unique("viewer-tex-roi"), roi));
 }
 
+/// The comp region (`[x, y, w, h]` in pixels) used for the texture: Region of Interest or Extended Viewer area,
+/// or `None` when no explicit region is stored, meaning the whole comp.
 fn texture_roi(ctx: &egui::Context) -> Option<[f64; 4]> {
-    ctx.data(|d| d.get_temp::<Option<[f64; 4]>>(egui::Id::new("viewer-tex-roi"))).flatten()
+    ctx.data(|d| d.get_temp::<Option<[f64; 4]>>(egui::Id::unique("viewer-tex-roi"))).flatten()
+}
+
+/// The comp area ([x, y, w, h], comp pixels) the shown frame covers: its region of interest or
+/// Extended Viewer area, else the whole `comp` (width, height).
+pub(crate) fn shown_region(ctx: &egui::Context, comp: [f32; 2]) -> [f64; 4] {
+    texture_roi(ctx).unwrap_or([0.0, 0.0, comp[0] as f64, comp[1] as f64])
 }
 
 /// Show Snapshot: the stored snapshot is on screen (button or F5 held).
@@ -331,26 +343,106 @@ pub(crate) fn showing_snapshot(app: &EffectcraftApp, ctx: &egui::Context) -> boo
     app.session.snapshot.is_some() && (app.session.state.viewer.show_snapshot || f5)
 }
 
-/// Show Channel and exposure, then the display colour conversion (View ▸ Use Display Color
-/// Management / Simulate Output).
-fn transformed(img: &egui::ColorImage, ch: Channel, colorized: bool, stops: f32, dc: Option<vw::DisplayColor>) -> egui::ColorImage {
-    let mut px: Vec<[u8; 4]> = img.pixels.iter().map(|c| c.to_array()).collect();
-    if let Some(dc) = dc.filter(|_| matches!(ch, Channel::Rgb | Channel::RgbStraight)) {
-        dc.apply(&mut px);
+/// The viewer's display pass for frames encoded as `encoding`: Show Channel, exposure, the HDR
+/// step such frames still need, then the display colour conversion `dc` (View ▸ Use Display
+/// Color Management / Simulate Output).
+pub(crate) fn display_pass(app: &EffectcraftApp, encoding: vw::FrameEncoding, dc: Option<&vw::DisplayColor>) -> vw::DisplayPass {
+    let o = &app.session.state.viewer;
+    vw::DisplayPass::new(o.channel, o.colorized, o.exposure, encoding, dc)
+}
+
+/// How the project's 8-bit viewer frames are encoded (rendered with the HDR step).
+pub(crate) fn rgba8_encoding(app: &EffectcraftApp) -> vw::FrameEncoding {
+    vw::FrameEncoding::of(&app.session.project.settings, false)
+}
+
+/// A key of a display pass's parameters, for the texture caches.
+pub(crate) fn pass_key(pass: &vw::DisplayPass) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    crate::display_gpu::uniform(pass).hash(&mut h);
+    if let Some(vw::PassColor::Lut(l)) = &pass.color {
+        (std::sync::Arc::as_ptr(l) as usize).hash(&mut h);
     }
-    vw::display_transform(&mut px, ch, colorized, stops);
+    h.finish()
+}
+
+/// The display pass on the CPU over an 8-bit frame.
+fn transformed(img: &egui::ColorImage, pass: &vw::DisplayPass) -> egui::ColorImage {
+    let mut px: Vec<[u8; 4]> = img.pixels.iter().map(|c| c.to_array()).collect();
+    pass.apply_rgba8(&mut px);
     egui::ColorImage::new(img.size, px.into_iter().map(|a| Color32::from_rgba_premultiplied(a[0], a[1], a[2], a[3])).collect())
 }
 
+/// The display conversion's inputs, for the texture caches.
+pub(crate) fn display_key(app: &EffectcraftApp, has_conversion: bool) -> String {
+    let opts = &app.session.state.viewer;
+    let custom = if opts.simulation.profile == vw::SimProfile::MyCustom { format!("{:?}", app.session.prefs.custom_rgb) } else { String::new() };
+    format!("{:?}{:?}{}{custom}", has_conversion, opts.simulation, app.session.prefs.previews.display_profile)
+        + &format!("{:?}{:?}{}", app.session.project.settings.working_space, app.session.project.settings.output_space, opts.display_color_management)
+}
+
+/// Draw `src` through `pass` into `rect`: the display pass on egui-wgpu's device (one texture per
+/// slot, with mips), else on the CPU into a texture averaged down for the magnification (#417).
+fn draw_through_pass(
+    app: &mut EffectcraftApp,
+    ctx: &egui::Context,
+    painter: &egui::Painter,
+    snapshot: bool,
+    src: crate::display_gpu::Source,
+    pass: &vw::DisplayPass,
+    rect: Rect,
+) {
+    let smooth = app.session.prefs.viewer_zoom_smooth();
+    if let Some(gpu) = app.display_gpu()
+        && let Some(rs) = &app.window_wgpu
+    {
+        let bake = if snapshot { &mut app.snapshot_bake } else { &mut app.viewer_bake };
+        if let Some(id) = bake.show(rs, &gpu, &src, pass, smooth) {
+            painter.image(id, rect, bake.uv(), Color32::WHITE);
+            return;
+        }
+    }
+    let size = src.size();
+    let minify = super::viewer::minify_factor(smooth, size[0] as f64, (rect.width() * ctx.pixels_per_point()) as f64);
+    let key = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        let ptr = match &src {
+            crate::display_gpu::Source::F16(f) => std::sync::Arc::as_ptr(f) as usize,
+            crate::display_gpu::Source::Rgba8(c) => std::sync::Arc::as_ptr(c) as usize,
+        };
+        (ptr, pass_key(pass), minify).hash(&mut h);
+        h.finish()
+    };
+    let id = egui::Id::unique(if snapshot { "viewer-snapshot-tex" } else { "viewer-display-tex" });
+    let tex = match ctx.data(|d| d.get_temp::<(u64, egui::TextureHandle)>(id)) {
+        Some((k, tex)) if k == key => tex,
+        _ => {
+            let img = match &src {
+                crate::display_gpu::Source::F16(f) => f.to_color_image(pass),
+                crate::display_gpu::Source::Rgba8(c) => transformed(c, pass),
+            };
+            let img = crate::frames::fit_texture_by(img, crate::frames::max_texture_side(ctx), minify);
+            let tex = ctx.load_texture(if snapshot { "viewer-snapshot" } else { "viewer-display" }, img, super::viewer::zoom_texture_options(smooth));
+            ctx.data_mut(|d| d.insert_temp(id, (key, tex.clone())));
+            tex
+        }
+    };
+    painter.image(tex.id(), rect, fitted_uv(ctx, size, minify), Color32::WHITE);
+}
+
 /// Draw the frame into `comp_rect`: the rendered frame (covering the region of interest when one
-/// is set), or the snapshot while Show Snapshot is on / F5 is held, through Show Channel and the
-/// exposure. Fast Previews ▸ Wireframe draws layer outlines instead.
+/// is set), or the snapshot while Show Snapshot is on / F5 is held, through the display pass (Show
+/// Channel, exposure, the HDR step of 32 bpc frames, display colour). Fast Previews ▸ Wireframe
+/// draws layer outlines instead.
 pub(crate) fn draw_frame(app: &mut EffectcraftApp, ctx: &egui::Context, painter: &egui::Painter, comp_rect: Rect, cid: ItemId, ectx: &EvalCtx) {
+    clear_sample_source(ctx);
     let opts = app.session.state.viewer.clone();
     let snap = showing_snapshot(app, ctx);
     // Settings ▸ Video ▸ Mirror on Computer Monitor off: playback goes to Video Preview only.
     if crate::prefs_live::main_viewer_hidden(app) && !snap {
-        painter.text(comp_rect.center(), Align2::CENTER_CENTER, "Playing on Video Preview", Tokens::ui(13.0), Color32::from_gray(150));
+        painter.text(comp_rect.center(), Align2::CENTER_CENTER, crate::i18n::tr("Playing on Video Preview"), Tokens::ui(13.0), Color32::from_gray(150));
         return;
     }
     if opts.fast_previews == FastPreviews::Wireframe && !snap {
@@ -370,83 +462,155 @@ pub(crate) fn draw_frame(app: &mut EffectcraftApp, ctx: &egui::Context, painter:
         }
         return;
     }
+    // The snapshot went (Purge, a new one): its half floats and texture go too.
+    if app
+        .snapshot_f16
+        .as_ref()
+        .is_some_and(|(img, _)| app.session.snapshot.as_ref().is_none_or(|s| !std::ptr::eq(img.as_ptr(), std::sync::Arc::as_ptr(&s.image))))
+    {
+        app.snapshot_f16 = None;
+        app.snapshot_bake.free(app.window_wgpu.as_ref());
+    }
     let dc = vw::DisplayColor::of(&app.session);
-    // The display conversion's inputs, for the texture caches.
-    let custom = if opts.simulation.profile == vw::SimProfile::MyCustom { format!("{:?}", app.session.prefs.custom_rgb) } else { String::new() };
-    let dc_key = format!("{:?}{:?}{}{custom}", dc.is_some(), opts.simulation, app.session.prefs.previews.display_profile)
-        + &format!("{:?}{:?}{}", app.session.project.settings.working_space, app.session.project.settings.output_space, opts.display_color_management);
-    let plain = opts.channel == Channel::Rgb && opts.exposure == 0.0 && dc.is_none();
+    let region = shown_region(ctx, [ectx.comp.width as f32, ectx.comp.height as f32]);
     let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
     if snap {
         let Some(s) = app.session.snapshot.clone() else { return };
-        let key = {
-            use std::hash::{Hash, Hasher};
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            (std::sync::Arc::as_ptr(&s.image) as usize, opts.channel.id(), opts.colorized, opts.exposure.to_bits(), &dc_key).hash(&mut h);
-            h.finish()
-        };
-        let id = egui::Id::new("viewer-snapshot-tex");
-        let tex = match ctx.data(|d| d.get_temp::<(u64, egui::TextureHandle)>(id)) {
-            Some((k, tex)) if k == key => tex,
-            _ => {
-                let img = crate::frames::to_color_image(&s.image);
-                let img = if plain { img } else { transformed(&img, opts.channel, opts.colorized, opts.exposure, dc) };
-                let tex = crate::frames::load_fitted(ctx, "viewer-snapshot", img, egui::TextureOptions::LINEAR);
-                ctx.data_mut(|d| d.insert_temp(id, (key, tex.clone())));
-                tex
+        let pass = display_pass(app, s.encoding, dc.as_ref());
+        // The snapshot in half floats, made once (it holds the render's full range).
+        let f = match &app.snapshot_f16 {
+            Some((_, f)) => f.clone(),
+            None => {
+                let f = std::sync::Arc::new(crate::frames::F16Frame::from_image(&s.image, s.encoding));
+                app.snapshot_f16 = Some((std::sync::Arc::downgrade(&s.image), f.clone()));
+                f
             }
         };
-        painter.image(tex.id(), comp_rect, uv, Color32::WHITE);
-        painter.text(comp_rect.left_top() + vec2(6.0, 6.0), Align2::LEFT_TOP, "Snapshot", Tokens::ui(11.0), SNAP_COLOR);
+        draw_through_pass(app, ctx, painter, true, crate::display_gpu::Source::F16(f), &pass, comp_rect);
+        note_sample_source(ctx, SampleSource::Snapshot(s.image.clone()), [0.0, 0.0, ectx.comp.width as f64, ectx.comp.height as f64], Some(pass));
+        painter.text(comp_rect.left_top() + vec2(6.0, 6.0), Align2::LEFT_TOP, crate::i18n::tr("Snapshot"), Tokens::ui(11.0), SNAP_COLOR);
         return;
     }
+    let zoom = comp_rect.width() as f64 / ectx.comp.width.max(1) as f64;
+    let roi_rect = || match texture_roi(ctx) {
+        Some([x, y, w, h]) => Rect::from_min_size(comp_rect.min + vec2((x * zoom) as f32, (y * zoom) as f32), vec2((w * zoom) as f32, (h * zoom) as f32)),
+        None => comp_rect,
+    };
+    // A half-float frame (32 bpc): always through the display pass, which applies the HDR step
+    // after the exposure.
+    if let Some(f) = app.viewer_f16.clone() {
+        if app.viewer_shown.is_none_or(|(_, k)| k.comp != cid.0) {
+            return;
+        }
+        let pass = display_pass(app, f.encoding, dc.as_ref());
+        draw_through_pass(app, ctx, painter, false, crate::display_gpu::Source::F16(f.clone()), &pass, roi_rect());
+        note_sample_source(ctx, SampleSource::F16(f), region, Some(pass));
+        return;
+    }
+    let pass = display_pass(app, rgba8_encoding(app), dc.as_ref());
+    let plain = pass.is_identity();
     // A GPU frame (the web viewer): drawn straight from its texture; Show Channel / exposure
     // read it back first (asynchronously in the browser: from the next frame on).
-    let gpu = matches!((&app.viewer_shown, &app.viewer_native), (Some(s), Some(n)) if s.0 == n.0 && s.1 == n.1 && n.1.comp == cid.0);
+    let gpu = matches!((&app.viewer_shown, &app.viewer_native), (Some(s), Some(n)) if s.0 == Some(n.0) && s.1 == n.1 && n.1.comp == cid.0);
     let rect = if gpu {
-        let Some(id) = app.viewer_shown.map(|s| s.0) else { return };
+        let Some(id) = app.viewer_shown.and_then(|s| s.0) else { return };
         if plain || app.viewer_pixels().is_none() {
             if !plain {
                 ctx.request_repaint();
             }
             painter.image(id, comp_rect, uv, Color32::WHITE);
+            if let Some((_, key)) = app.viewer_shown {
+                note_sample_source(ctx, SampleSource::Gpu(key), region, None);
+            }
             return;
         }
         comp_rect
     } else {
-        let Some((tex, k)) = app.viewer_tex.clone() else { return };
+        let Some((tex, k, minify)) = app.viewer_tex.clone() else { return };
         if k.comp != cid.0 {
             return;
         }
-        let zoom = comp_rect.width() as f64 / ectx.comp.width.max(1) as f64;
-        let rect = match texture_roi(ctx) {
-            Some([x, y, w, h]) => Rect::from_min_size(comp_rect.min + vec2((x * zoom) as f32, (y * zoom) as f32), vec2((w * zoom) as f32, (h * zoom) as f32)),
-            None => comp_rect,
-        };
+        let rect = roi_rect();
         if plain {
+            let uv = app.viewer_image.as_ref().map_or(uv, |src| fitted_uv(ctx, src.size, minify));
             painter.image(tex.id(), rect, uv, Color32::WHITE);
+            if let Some(image) = app.viewer_image.clone() {
+                note_sample_source(ctx, SampleSource::Cpu(image), region, None);
+            }
             return;
         }
         rect
     };
     let Some(src) = app.viewer_image.clone() else { return };
-    let zoom_opts = super::viewer::zoom_texture_options(app.session.prefs.viewer_zoom_smooth());
-    let key = {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        (std::sync::Arc::as_ptr(&src) as usize, opts.channel.id(), opts.colorized, opts.exposure.to_bits(), &dc_key).hash(&mut h);
-        h.finish()
-    };
-    let id = egui::Id::new("viewer-display-tex");
-    let tex = match ctx.data(|d| d.get_temp::<(u64, egui::TextureHandle)>(id)) {
-        Some((k, tex)) if k == key => tex,
-        _ => {
-            let tex = crate::frames::load_fitted(ctx, "viewer-display", transformed(&src, opts.channel, opts.colorized, opts.exposure, dc), zoom_opts);
-            ctx.data_mut(|d| d.insert_temp(id, (key, tex.clone())));
-            tex
+    draw_through_pass(app, ctx, painter, false, crate::display_gpu::Source::Rgba8(src.clone()), &pass, rect);
+    note_sample_source(ctx, SampleSource::Cpu(src), region, Some(pass));
+}
+
+#[derive(Clone)]
+enum SampleSource {
+    Cpu(std::sync::Arc<egui::ColorImage>),
+    F16(std::sync::Arc<crate::frames::F16Frame>),
+    Gpu(crate::frames::FrameKey),
+    Snapshot(std::sync::Arc<effectcraft_engine::render::Image>),
+}
+
+#[derive(Clone)]
+struct DisplayedSample {
+    pass: u64,
+    source: SampleSource,
+    region: [f64; 4],
+    display: Option<vw::DisplayPass>,
+}
+
+fn sample_source_id() -> egui::Id {
+    egui::Id::unique("viewer-displayed-sample-source")
+}
+
+pub(crate) fn clear_sample_source(ctx: &egui::Context) {
+    ctx.data_mut(|data| data.remove::<DisplayedSample>(sample_source_id()));
+}
+
+fn note_sample_source(ctx: &egui::Context, source: SampleSource, region: [f64; 4], display: Option<vw::DisplayPass>) {
+    let sample = DisplayedSample { pass: ctx.cumulative_pass_nr(), source, region, display };
+    ctx.data_mut(|data| data.insert_temp(sample_source_id(), sample));
+}
+
+/// Sample only a frame actually drawn this pass, with that draw's display pass (channel,
+/// exposure, HDR step and display conversion). Hidden and wireframe views deliberately have no
+/// sample source.
+pub(crate) fn sample_displayed(app: &EffectcraftApp, ctx: &egui::Context, point: [f64; 2]) -> Option<[f32; 4]> {
+    let sample = ctx.data(|data| data.get_temp::<DisplayedSample>(sample_source_id()))?;
+    if sample.pass != ctx.cumulative_pass_nr() {
+        return None;
+    }
+    let rgba8 = |c: Color32| c.to_array().map(|v| v as f32 / 255.0);
+    // The frame's premultiplied pixel.
+    let raw: [f32; 4] = match sample.source {
+        SampleSource::Cpu(image) => rgba8(super::fx_widgets::frame_pixel(&image, sample.region, point)?),
+        SampleSource::F16(f) => f.pixel(super::fx_widgets::frame_pixel_index(f.size(), sample.region, point)?)?,
+        SampleSource::Gpu(key) => {
+            if app.viewer_shown.map(|(_, shown)| shown) != Some(key) {
+                return None;
+            }
+            rgba8(super::fx_widgets::frame_pixel(app.viewer_image.as_ref()?, sample.region, point)?)
+        }
+        SampleSource::Snapshot(image) => {
+            let index = super::fx_widgets::frame_pixel_index([image.width as usize, image.height as usize], sample.region, point)?;
+            *image.data.get(index)?
         }
     };
-    painter.image(tex.id(), rect, uv, Color32::WHITE);
+    let shown = match &sample.display {
+        Some(pass) => pass.pixel(raw),
+        None => crate::frames::display_pixel(raw).to_array(),
+    };
+    let image = egui::ColorImage::new([1, 1], vec![Color32::from_rgba_premultiplied(shown[0], shown[1], shown[2], shown[3])]);
+    super::fx_widgets::sample_frame(&image, [0.0, 0.0, 1.0, 1.0], [0.5, 0.5])
+}
+
+/// The texture coordinates of a frame of `size` in its texture, fitted with at least `minify`
+/// (see [`crate::frames::fitted_uv`]).
+fn fitted_uv(ctx: &egui::Context, size: [usize; 2], minify: usize) -> Rect {
+    crate::frames::fitted_uv(size, crate::frames::fit_factor(size, crate::frames::max_texture_side(ctx), minify))
 }
 
 // ---------------------------------------------------------------- bottom bar
@@ -454,7 +618,7 @@ pub(crate) fn draw_frame(app: &mut EffectcraftApp, ctx: &egui::Context, painter:
 /// A popup list above `anchor` (selected entries highlighted); entries register
 /// `viewer.<auto>.<n>` automation ids.
 fn popup(app: &mut EffectcraftApp, ui: &mut egui::Ui, id: &str, anchor: Rect, items: &[(String, bool)], auto: &str) -> Option<usize> {
-    let pid = egui::Id::new(id);
+    let pid = egui::Id::unique(id);
     if !widgets::popup_is_open(ui, pid) {
         return None;
     }
@@ -468,7 +632,9 @@ fn popup(app: &mut EffectcraftApp, ui: &mut egui::Ui, id: &str, anchor: Rect, it
                 ui.separator();
                 continue;
             }
-            let r = ui.selectable_label(*on, label.as_str());
+            // The item is the English source: the drawn text is looked up in the catalog, while
+            // the automation label stays English for scripts and tests.
+            let r = ui.selectable_label(*on, crate::i18n::tr(label));
             app.auto.add(&format!("viewer.{auto}.{i}"), r.rect, label);
             if r.clicked() {
                 chosen = Some(i);
@@ -478,10 +644,58 @@ fn popup(app: &mut EffectcraftApp, ui: &mut egui::Ui, id: &str, anchor: Rect, it
     })
 }
 
+/// Flip the open flag of the popup with `id`; the caller that owns the popup reads the same flag.
 fn toggle_popup(ui: &egui::Ui, id: &str) {
-    let pid = egui::Id::new(id).with("open");
+    let pid = egui::Id::unique(id).with("open");
     let open: bool = ui.data(|d| d.get_temp(pid).unwrap_or(false));
     ui.data_mut(|d| d.insert_temp(pid, !open));
+}
+
+/// A magnification ratio dropdown (the Composition and Layer panels' footers): `zoom` is the
+/// shown magnification and `current` the stored one (None = fit), both in points per pixel.
+/// Returns the chosen magnification (`Some(None)` = Fit).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn magnification_menu(
+    app: &mut EffectcraftApp,
+    ui: &mut egui::Ui,
+    r: Rect,
+    id: &str,
+    auto_id: &str,
+    auto_items: &str,
+    zoom: f32,
+    current: Option<f32>,
+    fit_up: bool,
+) -> Option<(Option<f32>, bool)> {
+    let t = app.tokens;
+    let ppp = ui.ctx().pixels_per_point();
+    let pop = format!("{id}-pop");
+    let response = widgets::dropdown(ui, r, &magnification_label(zoom * ppp * 100.0), &t, egui::Id::unique(id))
+        .on_hover_text(crate::i18n::tr("Magnification ratio popup"));
+    if response.clicked() {
+        toggle_popup(ui, &pop);
+    }
+    app.auto.add_response(auto_id, &response, "Magnification");
+    const MAGS: [&str; 15] = ["Fit", "Fit up to 100%", "-", "1.5%", "3.1%", "6.25%", "12.5%", "25%", "33.3%", "50%", "100%", "200%", "400%", "800%", "1600%"];
+    let cur = (zoom * ppp * 100.0 * 10.0).round() / 10.0;
+    let items: Vec<(String, bool)> = MAGS
+        .iter()
+        .map(|m| {
+            let on = match *m {
+                "Fit" => current.is_none() && !fit_up,
+                "Fit up to 100%" => current.is_none() && fit_up,
+                s => s.trim_end_matches('%').parse::<f32>().is_ok_and(|v| current.is_some() && (v - cur).abs() < 0.06),
+            };
+            (m.to_string(), on)
+        })
+        .collect();
+    let i = popup(app, ui, &pop, r, &items, auto_items)?;
+    // `(zoom, fit up to 100 %)`: Fit and Fit up to 100% leave the zoom unset (it follows the
+    // panel size).
+    match *MAGS.get(i)? {
+        "Fit" => Some((None, false)),
+        "Fit up to 100%" => Some((None, true)),
+        s => s.trim_end_matches('%').parse::<f32>().ok().map(|v| (Some(v / 100.0 / ppp), false)),
+    }
 }
 
 /// Magnification as After Effects shows it: "136.1 %", "100 %".
@@ -502,65 +716,98 @@ pub(crate) fn resolution_label(res: Resolution, scale: f64) -> String {
             } else {
                 "Quarter"
             };
-            format!("({r})")
+            format!("({})", crate::i18n::tr(r))
         }
-        Resolution::Custom(n) => format!("Custom ({n})"),
-        r => r.label().to_string(),
+        Resolution::Custom(n) => format!("{} ({n})", crate::i18n::tr("Custom")),
+        r => crate::i18n::tr(r.label()).to_string(),
     }
 }
 
 /// The Composition panel's bottom bar, in After Effects 2026 order: magnification, resolution,
-/// transparency grid, mask and shape path visibility, region of interest, grid and guide
-/// options, show channel, reset exposure, exposure, take / show snapshot, Fast Previews, the 3D
+/// Fast Previews, transparency grid, mask and shape path visibility, region of interest, grid and
+/// guide options, show channel, reset exposure, exposure, take / show snapshot, the 3D
 /// renderer and view, and the current time.
-pub(crate) fn bottom_bar(app: &mut EffectcraftApp, ui: &mut egui::Ui, bar: Rect, zoom: f32, fit: f32, time: Tick, comp: &Comp) {
+pub(crate) fn bottom_bar(app: &mut EffectcraftApp, ui: &mut egui::Ui, bar: Rect, zoom: f32, time: Tick, comp: &Comp) {
     let t = app.tokens;
     let p = ui.painter().clone();
     p.rect_filled(bar, 0.0, t.panel_bg);
     p.line_segment([bar.left_top(), bar.right_top()], Stroke::new(1.0, t.separator));
+    app.auto.add("viewer.controls", bar, "Viewer controls");
+    ui.scope_builder(egui::UiBuilder::new().max_rect(bar), |ui| {
+        let scroll = &mut ui.style_mut().spacing.scroll;
+        scroll.floating = false;
+        scroll.foreground_color = true;
+        scroll.bar_width = 4.0;
+        scroll.bar_inner_margin = 1.0;
+        scroll.bar_outer_margin = 1.0;
+        egui::ScrollArea::horizontal().id_salt("viewer-controls").auto_shrink([false, false]).show(ui, |ui| {
+            let row = Rect::from_min_size(ui.max_rect().min, vec2(bar.width(), 30.0));
+            let first_control = app.auto.elements.len();
+            let width = bottom_bar_contents(app, ui, row, zoom, time, comp);
+            ui.allocate_rect(Rect::from_min_size(row.min, vec2(width, row.height())), Sense::hover());
+            if let Some(focused) = ui.ctx().memory(|memory| memory.focused())
+                && app.auto.elements.get(first_control..).is_some_and(|controls| controls.iter().any(|control| control.response_id == Some(focused)))
+                && let Some(response) = ui.ctx().read_response(focused)
+                && response.gained_focus()
+            {
+                ui.scroll_to_rect(response.rect, None);
+            }
+        });
+    });
+}
+
+/// The exposure drag field (stops) at `er`; a change runs `view.exposure`.
+fn exposure_field(app: &mut EffectcraftApp, ui: &mut egui::Ui, er: Rect, stops: f64) {
+    let mut ev = stops;
+    let resp = ui.put(
+        er,
+        crate::widgets::drag_value(
+            egui::DragValue::new(&mut ev)
+                .speed(0.05)
+                .range(-40.0..=40.0)
+                .fixed_decimals(1)
+                .custom_formatter(|v, _| if v == 0.0 { "0.0".into() } else { format!("{v:+.1}") }),
+        ),
+    );
+    let resp = resp.on_hover_text(crate::i18n::tr("Adjust Exposure (stops)"));
+    app.auto.add_response("viewer.exposure", &resp, "Adjust Exposure");
+    if resp.changed() {
+        let _ = app.session.execute("view.exposure", json!({"stops": ev}));
+    }
+}
+
+/// Lay out the viewer's control row from `bar.min.x`: magnification, resolution, Fast Previews,
+/// transparency, mask, ROI, grid/guide, channel/colour management, exposure, snapshot, 3D
+/// renderer/view and Extended Viewer, timecode and render-time indicators, running commands or
+/// toggling viewer UI state. Returns the width the row occupies, at least `bar.width()`, for the
+/// horizontal scroll area.
+fn bottom_bar_contents(app: &mut EffectcraftApp, ui: &mut egui::Ui, bar: Rect, zoom: f32, time: Tick, comp: &Comp) -> f32 {
+    let t = app.tokens;
+    let p = ui.painter().clone();
     let cy = bar.center().y;
     let mut x = bar.min.x + 8.0;
     let ppp = ui.ctx().pixels_per_point();
 
     // Magnification.
     let r = Rect::from_min_size(pos2(x, cy - 10.0), vec2(80.0, 20.0));
-    if widgets::dropdown(ui, r, &magnification_label(zoom * ppp * 100.0), &t, egui::Id::new("vw-mag")).on_hover_text("Magnification ratio popup").clicked() {
-        toggle_popup(ui, "vw-mag-pop");
-    }
-    app.auto.add("viewer.magnification", r, "Magnification");
-    const MAGS: [&str; 15] = ["Fit", "Fit up to 100%", "-", "1.5%", "3.1%", "6.25%", "12.5%", "25%", "33.3%", "50%", "100%", "200%", "400%", "800%", "1600%"];
-    let cur = (zoom * ppp * 100.0 * 10.0).round() / 10.0;
-    let items: Vec<(String, bool)> = MAGS
-        .iter()
-        .map(|m| {
-            let on = match *m {
-                "Fit" => app.ui.viewer.zoom.is_none(),
-                s => s.trim_end_matches('%').parse::<f32>().is_ok_and(|v| app.ui.viewer.zoom.is_some() && (v - cur).abs() < 0.06),
-            };
-            (m.to_string(), on)
-        })
-        .collect();
-    if let Some(i) = popup(app, ui, "vw-mag-pop", r, &items, "magnification") {
+    let fit_up = app.ui.viewer.fit_up_to_100;
+    if let Some((z, up)) = magnification_menu(app, ui, r, "vw-mag", "viewer.magnification", "magnification", zoom, app.ui.viewer.zoom, fit_up) {
         app.ui.viewer.pan = [0.0, 0.0];
-        app.ui.viewer.zoom = match MAGS[i] {
-            "Fit" => None,
-            "Fit up to 100%" => Some(fit.min(1.0 / ppp)),
-            s => s.trim_end_matches('%').parse::<f32>().ok().map(|v| v / 100.0 / ppp),
-        };
+        app.ui.viewer.fit_up_to_100 = up;
+        app.ui.viewer.zoom = z;
     }
     x = r.max.x + 4.0;
 
     // Resolution / down-sample factor.
     let r = Rect::from_min_size(pos2(x, cy - 10.0), vec2(84.0, 20.0));
     let scale = app.viewer_scale(zoom, ppp);
-    if widgets::dropdown(ui, r, &resolution_label(app.ui.viewer.res, scale), &t, egui::Id::new("vw-res"))
-        .on_hover_text("Resolution/Down Sample Factor Popup")
-        .clicked()
-    {
+    let res = app.viewer_res();
+    let response = widgets::dropdown(ui, r, &resolution_label(res, scale), &t, egui::Id::unique("vw-res"))
+        .on_hover_text(crate::i18n::tr("Resolution/Down Sample Factor Popup"));
+    if response.clicked() {
         toggle_popup(ui, "vw-res-pop");
     }
-    app.auto.add("viewer.resolution", r, "Resolution/Down Sample Factor");
-    let res = app.ui.viewer.res;
+    app.auto.add_response("viewer.resolution", &response, "Resolution/Down Sample Factor");
     let items: Vec<(String, bool)> = vec![
         ("Full".into(), res == Resolution::Full),
         ("Half".into(), res == Resolution::Half),
@@ -581,11 +828,23 @@ pub(crate) fn bottom_bar(app: &mut EffectcraftApp, ui: &mut egui::Ui, bar: Rect,
 
     let tog = |ui: &mut egui::Ui, auto: &mut crate::automation::Registry, x: &mut f32, icon: Icon, on: bool, id: &str, tip: &str| -> (bool, Rect) {
         let r = Rect::from_min_size(pos2(*x, cy - 11.0), vec2(22.0, 22.0));
-        let resp = widgets::icon_button(ui, r, icon, on, &t, egui::Id::new(("vw-btn", id))).on_hover_text(tip);
-        auto.add(&format!("viewer.{id}"), r, tip);
+        // The tip is the English source: the tooltip is looked up in the catalog, while the
+        // automation label stays English for scripts and tests.
+        let resp = widgets::icon_button(ui, r, icon, on, &t, egui::Id::unique(("vw-btn", id))).on_hover_text(crate::i18n::tr(tip));
+        auto.add_response(&format!("viewer.{id}"), &resp, tip);
         *x += 24.0;
         (resp.clicked(), r)
     };
+    // Fast Previews.
+    let fp = app.session.state.viewer.fast_previews;
+    let (clicked, fr) = tog(ui, &mut app.auto, &mut x, Icon::Sparkle, fp != FastPreviews::Off || app.ui.viewer.fast_preview, "fastPreviews", "Fast Previews");
+    if clicked {
+        toggle_popup(ui, "vw-fast-pop");
+    }
+    let items: Vec<(String, bool)> = FastPreviews::ALL.iter().map(|m| (m.label().to_string(), fp == *m)).collect();
+    if let Some(i) = popup(app, ui, "vw-fast-pop", fr, &items, "fastPreviewsItem") {
+        let _ = app.session.execute("view.fastPreviewMode", json!({"mode": FastPreviews::ALL[i].id()}));
+    }
     if tog(ui, &mut app.auto, &mut x, Icon::Checker, app.ui.viewer.transparency_grid, "transparency", "Toggle Transparency Grid").0 {
         app.ui.viewer.transparency_grid = !app.ui.viewer.transparency_grid;
     }
@@ -651,20 +910,7 @@ pub(crate) fn bottom_bar(app: &mut EffectcraftApp, ui: &mut egui::Ui, bar: Rect,
         let _ = app.session.execute("view.resetExposure", json!({}));
     }
     let er = Rect::from_min_size(pos2(x, cy - 10.0), vec2(42.0, 20.0));
-    let mut ev = vo.exposure as f64;
-    let resp = ui.put(
-        er,
-        egui::DragValue::new(&mut ev)
-            .speed(0.05)
-            .range(-40.0..=40.0)
-            .fixed_decimals(1)
-            .custom_formatter(|v, _| if v == 0.0 { "0.0".into() } else { format!("{v:+.1}") }),
-    );
-    let resp = resp.on_hover_text("Adjust Exposure (stops)");
-    app.auto.add("viewer.exposure", er, "Adjust Exposure");
-    if resp.changed() {
-        let _ = app.session.execute("view.exposure", json!({"stops": ev}));
-    }
+    exposure_field(app, ui, er, vo.exposure as f64);
     x = er.max.x + 4.0;
     // Snapshots.
     if tog(ui, &mut app.auto, &mut x, Icon::Snapshot, false, "snapshot", "Take Snapshot").0 {
@@ -677,36 +923,41 @@ pub(crate) fn bottom_bar(app: &mut EffectcraftApp, ui: &mut egui::Ui, bar: Rect,
     let showing = showing_snapshot(app, ui.ctx());
     let (_, sr) = tog(ui, &mut app.auto, &mut x, Icon::ShowSnapshot, showing, "showSnapshot", "Show Snapshot (hold)");
     // Show Snapshot works while the button is held, like F5.
-    let held = ui.input(|i| i.pointer.primary_down()) && ui.input(|i| i.pointer.press_origin()).is_some_and(|o| sr.contains(o));
+    let held = ui.input(|i| i.pointer.primary_down()) && ui.input(|i| i.pointer.press_origin()).is_some_and(|o| sr.intersect(ui.clip_rect()).contains(o));
     if app.session.snapshot.is_some() && held != app.session.state.viewer.show_snapshot {
         let _ = app.session.execute("view.showSnapshot", json!({"value": held}));
-    }
-    // Fast Previews.
-    let fp = vo.fast_previews;
-    let (clicked, fr) = tog(ui, &mut app.auto, &mut x, Icon::Sparkle, fp != FastPreviews::Off || app.ui.viewer.fast_preview, "fastPreviews", "Fast Previews");
-    if clicked {
-        toggle_popup(ui, "vw-fast-pop");
-    }
-    let items: Vec<(String, bool)> = FastPreviews::ALL.iter().map(|m| (m.label().to_string(), fp == *m)).collect();
-    if let Some(i) = popup(app, ui, "vw-fast-pop", fr, &items, "fastPreviewsItem") {
-        let _ = app.session.execute("view.fastPreviewMode", json!({"mode": FastPreviews::ALL[i].id()}));
     }
     x += 4.0;
     // 3D renderer + view.
     if comp.has_3d() {
+        // The comp's 3D renderer, as After Effects' Composition panel shows it: the menu switches
+        // it through Composition Settings (undoable), and the automation label is the renderer.
+        use effectcraft_engine::project::Renderer;
+        let renderers = [(Renderer::Classic3D, "Classic 3D", "classic3D"), (Renderer::Advanced3D, "Advanced 3D", "advanced3D")];
+        let current = renderers.iter().find(|(r, ..)| *r == comp.renderer).map_or("Classic 3D", |(_, label, _)| *label);
         let r = Rect::from_min_size(pos2(x, cy - 10.0), vec2(96.0, 20.0));
-        let _ = widgets::dropdown(ui, r, "Classic 3D", &t, egui::Id::new("vw-3d"));
-        app.auto.add("viewer.renderer3d", r, "3D Renderer");
+        if widgets::dropdown(ui, r, crate::i18n::tr(current), &t, egui::Id::unique("vw-3d")).clicked() {
+            toggle_popup(ui, "vw-3d-pop");
+        }
+        app.auto.add("viewer.renderer3d", r, current);
+        let items: Vec<(String, bool)> = renderers.iter().map(|(r, label, _)| (label.to_string(), *r == comp.renderer)).collect();
+        if let Some((renderer, _, id)) = popup(app, ui, "vw-3d-pop", r, &items, "renderer3dItem").and_then(|i| renderers.get(i))
+            && *renderer != comp.renderer
+            && let Err(e) = app.session.execute("comp.settings", json!({"renderer": id}))
+        {
+            app.ui.status = e.to_string();
+        }
         x = r.max.x + 4.0;
         let cid = app.session.active_comp_id();
         let cur = cid.and_then(|c| app.session.state.views3d.get(&c)).map(|v| v.current).unwrap_or_default();
         let r = Rect::from_min_size(pos2(x, cy - 10.0), vec2(118.0, 20.0));
-        if widgets::dropdown(ui, r, cur.label(), &t, egui::Id::new("vw-cam")).clicked() {
+        let response = widgets::dropdown(ui, r, crate::panels::viewer::view3d_label(cur), &t, egui::Id::unique("vw-cam"));
+        if response.clicked() {
             toggle_popup(ui, "vw-cam-pop");
         }
-        app.auto.add("viewer.view3d", r, "3D View");
+        app.auto.add_response("viewer.view3d", &response, "3D View");
         use effectcraft_engine::render::three_d::View3D;
-        let items: Vec<(String, bool)> = View3D::ALL.iter().map(|v| (v.label().to_string(), *v == cur)).collect();
+        let items: Vec<(String, bool)> = View3D::ALL.iter().map(|v| (crate::panels::viewer::view3d_label(*v).to_string(), *v == cur)).collect();
         if let Some(i) = popup(app, ui, "vw-cam-pop", r, &items, "view3dItem") {
             let _ = app.session.execute("view.set3DView", json!({"view": View3D::ALL[i].id()}));
         }
@@ -723,12 +974,19 @@ pub(crate) fn bottom_bar(app: &mut EffectcraftApp, ui: &mut egui::Ui, bar: Rect,
     let g = p.layout_no_wrap(tc, Tokens::mono(12.0), t.timecode);
     let tr = Rect::from_min_size(pos2(x + 4.0, cy - 9.0), g.size() + vec2(8.0, 4.0));
     p.galley(pos2(tr.min.x + 4.0, tr.min.y + 2.0), g, t.timecode);
-    app.auto.add("viewer.timecode", tr, "Current time");
+    let resp = ui.interact(tr, egui::Id::unique("vw-timecode"), Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Current time"));
+    if resp.has_focus() {
+        p.rect_stroke(tr.shrink(1.0), 2.0, Stroke::new(1.0, t.focus), StrokeKind::Inside);
+    }
+    app.auto.add_response("viewer.timecode", &resp, "Current time");
+    crate::panels::toggle_time_display(app, &resp);
     // Right: render time.
     let ms = app.frames.last_ms.lock().map(|v| *v).unwrap_or(0.0);
     if tr.max.x + 50.0 < bar.max.x {
         p.text(pos2(bar.max.x - 10.0, cy), Align2::RIGHT_CENTER, format!("{ms:.0} ms"), Tokens::ui(11.0), t.text_faint);
     }
+    (tr.right() + 8.0 - bar.left()).max(bar.width())
 }
 
 #[cfg(test)]
@@ -744,5 +1002,49 @@ mod tests {
         assert_eq!(resolution_label(Resolution::Auto, 0.5), "(Half)");
         assert_eq!(resolution_label(Resolution::Quarter, 0.25), "Quarter");
         assert_eq!(resolution_label(Resolution::Custom(5), 0.2), "Custom (5)");
+    }
+
+    /// Auto renders the pixels the magnification needs, as in After Effects: Full above 50 %,
+    /// Half down to 33.3 %, Third down to 25 %, Quarter below — never fewer pixels than the
+    /// screen shows (#417: 60 % rendered at Half).
+    #[test]
+    fn auto_resolution_follows_the_magnification() {
+        let auto = |zoom: f32, ppp: f32| resolution_label(Resolution::Auto, Resolution::Auto.scale(zoom, ppp));
+        for (zoom, want) in [(2.0, "(Full)"), (1.0, "(Full)"), (0.6, "(Full)"), (0.51, "(Full)"), (0.5, "(Half)"), (0.46, "(Half)"), (0.34, "(Half)")] {
+            assert_eq!(auto(zoom, 1.0), want, "{zoom}");
+        }
+        for (zoom, want) in [(1.0 / 3.0, "(Third)"), (0.26, "(Third)"), (0.25, "(Quarter)"), (0.1, "(Quarter)"), (0.0, "(Quarter)")] {
+            assert_eq!(auto(zoom, 1.0), want, "{zoom}");
+        }
+        // Magnification in points on a 150 % display: 40 % shows 60 % of the comp's pixels.
+        assert_eq!(auto(0.4, 1.5), "(Full)");
+        assert_eq!(auto(f32::NAN, 1.0), "(Full)");
+        assert_eq!(Resolution::Full.scale(0.1, 1.0), 1.0);
+    }
+
+    /// CPU frames go up averaged down to about one texel per screen pixel (More Accurate only),
+    /// drawn with texture coordinates that keep each texel over its pixels (#417).
+    #[test]
+    fn minified_frames_keep_their_texels_in_place() {
+        use crate::panels::viewer::minify_factor;
+        assert_eq!(minify_factor(true, 1.0, 0.46), 2);
+        assert_eq!(minify_factor(true, 1.0, 0.5), 2);
+        assert_eq!(minify_factor(true, 1.0, 0.51), 1);
+        assert_eq!(minify_factor(true, 0.5, 0.46), 1, "a Half frame at 46 %");
+        assert_eq!(minify_factor(true, 1.0, 1.0 / 3.0), 3);
+        assert_eq!(minify_factor(true, 1.0, 2.0), 1);
+        assert_eq!(minify_factor(false, 1.0, 0.1), 1, "Faster keeps every pixel");
+        assert_eq!(minify_factor(true, 1.0, 0.0), 256);
+        assert_eq!(minify_factor(true, f64::NAN, 1.0), 1);
+        // 2560 px by 3: 854 texels hold 2562 px, the image is 2560 / 2562 of them.
+        let uv = crate::frames::fitted_uv([2560, 1440], 3);
+        assert!((uv.max.x - 2560.0 / 2562.0).abs() < 1e-6 && uv.max.y == 1.0, "{uv:?}");
+        assert_eq!(crate::frames::fitted_uv([7, 5], 1).max, egui::pos2(1.0, 1.0));
+        let img =
+            egui::ColorImage::new([5, 1], vec![egui::Color32::WHITE, egui::Color32::BLACK, egui::Color32::WHITE, egui::Color32::BLACK, egui::Color32::WHITE]);
+        let out = crate::frames::fit_texture_by(img, 4096, 2);
+        assert_eq!(out.size, [3, 1]);
+        assert_eq!(out.pixels[1], egui::Color32::from_gray(128), "texels average their pixels");
+        assert_eq!(out.pixels[2], egui::Color32::WHITE, "the last one only the pixels it holds");
     }
 }

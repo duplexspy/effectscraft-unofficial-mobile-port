@@ -6,10 +6,12 @@
 //! `templates.default.<Slot>`, `templates.select`, `templates.duplicate`, `templates.delete`,
 //! `templates.newName`, `templates.saveFromItem`, `templates.ok`.
 
+use crate::i18n::{tr, tr_args};
 use effectcraft_engine::project::render_templates::{RenderTemplates, TemplateKind, TemplateSlot};
 use egui::{Color32, vec2};
 use serde_json::{Value, json};
 
+use crate::a11y;
 use crate::theme::Tokens;
 use crate::{Dialog, EffectcraftApp};
 
@@ -20,8 +22,10 @@ struct State {
     new_name: String,
 }
 
+/// The `egui::Id` of the render-settings / output-module template dialog's state ([`State`]):
+/// which kind it edits, the selected template and the name being typed.
 fn state_id() -> egui::Id {
-    egui::Id::new("rq-templates-dialog")
+    egui::Id::unique("rq-templates-dialog")
 }
 
 /// Open the dialog for `kind` (`renderSettings` | `outputModule`).
@@ -51,17 +55,18 @@ pub fn show(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
     let mut close = false;
     let title = if st.output { "Output Module Templates" } else { "Render Settings Templates" };
     super::dialogs::modal(ctx, title, vec2(600.0, 560.0), t, |ui| {
-        ui.label(egui::RichText::new("Defaults").font(Tokens::semibold(12.5)).color(t.text));
+        ui.label(egui::RichText::new(tr("Defaults")).font(Tokens::semibold(12.5)).color(t.text));
         egui::Grid::new("tpl-defaults").num_columns(2).spacing(vec2(14.0, 6.0)).show(ui, |ui| {
             for slot in TemplateSlot::ALL {
                 ui.label(slot.label());
                 let cur = templates.default_name(k, slot);
                 let mut pick = cur.clone();
-                let r = egui::ComboBox::from_id_salt(("tpl-def", slot.label())).selected_text(&cur).width(300.0).show_ui(ui, |ui| {
+                let r = craft_ui::ComboBox::from_id_salt(("tpl-def", slot.label())).selected_text(&cur).width(300.0).show_ui(ui, |ui| {
                     for n in &list {
                         ui.selectable_value(&mut pick, n.clone(), n);
                     }
                 });
+                a11y::combo_box(&r.response, slot.label(), &cur, true);
                 app.auto.add(&format!("templates.default.{slot:?}"), r.response.rect, &cur);
                 if pick != cur {
                     actions.push(("renderQueue.setTemplateDefault", json!({"kind": kind, "slot": format!("{slot:?}"), "name": pick})));
@@ -71,14 +76,15 @@ pub fn show(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
         });
         ui.add_space(12.0);
         ui.separator();
-        ui.label(egui::RichText::new("Settings").font(Tokens::semibold(12.5)).color(t.text));
+        ui.label(egui::RichText::new(tr("Settings")).font(Tokens::semibold(12.5)).color(t.text));
         ui.horizontal(|ui| {
-            ui.label("Settings Name:");
-            let r = egui::ComboBox::from_id_salt("tpl-select").selected_text(&st.selected).width(300.0).show_ui(ui, |ui| {
+            ui.label(tr("Settings Name:"));
+            let r = craft_ui::ComboBox::from_id_salt("tpl-select").selected_text(&st.selected).width(300.0).show_ui(ui, |ui| {
                 for n in &list {
                     ui.selectable_value(&mut st.selected, n.clone(), n);
                 }
             });
+            a11y::combo_box(&r.response, tr("Settings Name:").trim_end_matches(':'), &st.selected, true);
             app.auto.add("templates.select", r.response.rect, &st.selected);
         });
         let builtin = RenderTemplates::is_builtin(k, &st.selected)
@@ -106,7 +112,7 @@ pub fn show(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
             });
         });
         ui.horizontal(|ui| {
-            let r = ui.button("Duplicate");
+            let r = ui.button(tr("Duplicate"));
             app.auto.add("templates.duplicate", r.rect, "Duplicate");
             if r.clicked() {
                 let mut n = format!("{} copy", st.selected);
@@ -118,13 +124,13 @@ pub fn show(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
                 actions.push(("renderQueue.saveTemplate", json!({"kind": kind, "name": n, "from": st.selected})));
                 st.selected = n;
             }
-            let r = ui.add_enabled(!builtin, egui::Button::new("Delete"));
+            let r = ui.add_enabled(!builtin, egui::Button::new(tr("Delete")));
             app.auto.add("templates.delete", r.rect, "Delete");
             if r.clicked() {
                 actions.push(("renderQueue.deleteTemplate", json!({"kind": kind, "name": st.selected})));
             }
             if builtin {
-                ui.label(egui::RichText::new("built-in").color(t.text_faint).size(11.0));
+                ui.label(egui::RichText::new(tr("built-in")).color(t.text_faint).size(11.0));
             }
         });
         ui.add_space(8.0);
@@ -132,12 +138,13 @@ pub fn show(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
         // New template from the selected (or only) Render Queue item.
         let queue = &app.session.project.render_queue;
         ui.horizontal(|ui| {
-            ui.label("New from Render Queue item:");
-            let r = ui.add(egui::TextEdit::singleline(&mut st.new_name).hint_text("template name").desired_width(180.0));
+            ui.label(tr("New from Render Queue item:"));
+            let r = ui.add(egui::TextEdit::singleline(&mut st.new_name).hint_text(tr("template name")).desired_width(180.0));
+            a11y::text_input(&r, tr("template name"), &st.new_name);
             app.auto.add("templates.newName", r.rect, &st.new_name);
             let item = queue.last().map(|i| i.id);
             let ok = item.is_some() && !st.new_name.trim().is_empty();
-            let r = ui.add_enabled(ok, egui::Button::new(format!("Save from #{}", queue.len().max(1))));
+            let r = ui.add_enabled(ok, egui::Button::new(tr_args("Save from #{}", &[&(queue.len().max(1))])));
             app.auto.add("templates.saveFromItem", r.rect, "Save from item");
             if r.clicked()
                 && let Some(id) = item
@@ -149,7 +156,7 @@ pub fn show(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
         });
         ui.add_space(12.0);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let r = ui.add(egui::Button::new(egui::RichText::new("   OK   ").color(Color32::WHITE)).fill(t.accent));
+            let r = ui.add(egui::Button::new(egui::RichText::new(tr("   OK   ")).color(Color32::WHITE)).fill(t.accent));
             app.auto.add("templates.ok", r.rect, "OK");
             close = r.clicked();
         });

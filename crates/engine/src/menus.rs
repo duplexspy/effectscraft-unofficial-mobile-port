@@ -18,10 +18,11 @@
 //! ```
 //!
 //! An entry's shortcut is the command's default shortcut unless the line gives one (needed for
-//! entries with bound parameters). Adobe-service entries (Team Projects, Libraries, Bridge, Media
-//! Encoder, Behance, Creative Cloud…) are intentionally absent; the Essential Graphics workspace
-//! uses the Properties panel and the Essential Graphics panel, whose templates use EffectCraft's
-//! own open `.ectemplate` format.
+//! entries with bound parameters). A line can give further default keys after a comma
+//! (`| F3, Cmd+Shift+T`); the menus show the first. Adobe-service entries (Team Projects,
+//! Libraries, Bridge, Media Encoder, Behance, Creative Cloud…) are intentionally absent; the
+//! Essential Graphics workspace uses the Properties panel and the Essential Graphics panel, whose
+//! templates use EffectCraft's own open `.ectemplate` format.
 
 use std::sync::OnceLock;
 
@@ -60,8 +61,14 @@ fn file_name(p: &str) -> String {
     std::path::Path::new(p).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| p.to_string())
 }
 
+/// The labels of a recent-files list: `names[i]`, or the whole of `full[i]` when another entry
+/// has the same name, so entries for two files named `Tool.jsx` tell them apart.
+fn distinct_labels(names: Vec<String>, full: &[String]) -> Vec<String> {
+    names.iter().zip(full).map(|(n, f)| if names.iter().filter(|m| *m == n).count() > 1 { f.clone() } else { n.clone() }).collect()
+}
+
 fn dyn_entry(label: String, command: &str, params: Value) -> MenuEntry {
-    MenuEntry { label, command: command.into(), params, shortcut: None }
+    MenuEntry { label, command: command.into(), params, shortcut: None, alt_shortcuts: vec![] }
 }
 
 /// The bindable holding shortcut `keys` in the active preset (its label).
@@ -71,26 +78,35 @@ fn holder_of(s: &Session, keys: &str) -> Option<String> {
 }
 
 /// The entries of a `@dynamic:<name>` node, and the disabled placeholder shown when there are
-/// none: `recentProjects`, `recentFootage`, `recentPresets`, `history` (undo steps, newest
+/// none: `recentProjects`, `recentFootage`, `recentPresets`, `recentScripts` (File ▸ Scripts ▸
+/// Recent Script Files), `history` (undo steps, newest
 /// first), `view3dShortcuts`, `workspaceShortcuts`, `savedWorkspaces` (Window ▸ Workspace) and
 /// `openViewers` (open compositions other than the active one), `scripts` (File ▸ Scripts) and
-/// `scriptPanels` (ScriptUI panels).
+/// `scriptPanels` (ScriptUI panels; a script in a subfolder is labelled `Folder/File.jsx` here,
+/// and [`dynamic_nodes`] puts it in the folder's submenu).
 pub fn dynamic(s: &Session, name: &str, cx: &DynCtx) -> (Vec<MenuEntry>, Option<&'static str>) {
     use serde_json::json;
     let indexed = |list: &[String], cmd: &str, stem: bool| -> Vec<MenuEntry> {
-        list.iter()
-            .enumerate()
-            .map(|(i, p)| {
-                let n =
-                    if stem { std::path::Path::new(p).file_stem().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| p.clone()) } else { file_name(p) };
-                dyn_entry(n, cmd, json!({"index": i}))
-            })
-            .collect()
+        let names = list
+            .iter()
+            .map(
+                |p| if stem { std::path::Path::new(p).file_stem().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| p.clone()) } else { file_name(p) },
+            )
+            .collect();
+        distinct_labels(names, list).into_iter().enumerate().map(|(i, n)| dyn_entry(n, cmd, json!({"index": i}))).collect()
     };
     match name {
         "recentProjects" => (indexed(&s.prefs.recent_projects, "file.openRecent", false), Some("No Recent Projects")),
         "recentFootage" => (indexed(&s.prefs.recent_footage, "file.importRecent", false), Some("No Recent Footage")),
         "recentPresets" => (indexed(&s.prefs.recent_presets, "anim.applyRecentPreset", true), Some("No Recent Presets")),
+        "recentScripts" => {
+            let full: Vec<String> = s.prefs.recent_scripts.iter().map(|r| r.text().to_string()).collect();
+            let names = full.iter().map(|p| file_name(p)).collect();
+            (
+                distinct_labels(names, &full).into_iter().enumerate().map(|(i, n)| dyn_entry(n, "file.runScript", json!({"recent": i}))).collect(),
+                Some("No Recent Script Files"),
+            )
+        }
         "history" => (
             s.history.undo.iter().rev().enumerate().map(|(i, (l, _))| dyn_entry(format!("Undo {l}"), "edit.history", json!({"steps": i + 1}))).collect(),
             Some("No History"),
@@ -152,6 +168,31 @@ pub fn dynamic(s: &Session, name: &str, cx: &DynCtx) -> (Vec<MenuEntry>, Option<
     }
 }
 
+/// [`dynamic`] as menu nodes, which is what frontends draw: scripts and panels in a subfolder
+/// (`Motion Kit/Animate.jsx`) go into a submenu named after the folder (`Motion Kit ▸
+/// Animate.jsx`), placed where the folder sorts among the other entries.
+pub fn dynamic_nodes(s: &Session, name: &str, cx: &DynCtx) -> (Vec<MenuNode>, Option<&'static str>) {
+    let (entries, empty) = dynamic(s, name, cx);
+    let scripts = matches!(name, "scripts" | "scriptPanels");
+    let mut out: Vec<MenuNode> = vec![];
+    for mut e in entries {
+        let Some((folder, file)) = e.label.split_once('/').filter(|_| scripts).map(|(d, f)| (d.to_string(), f.to_string())) else {
+            out.push(MenuNode::Item(e));
+            continue;
+        };
+        e.label = file;
+        let open = out.iter_mut().find_map(|n| match n {
+            MenuNode::Submenu { label, children } if *label == folder => Some(children),
+            _ => None,
+        });
+        match open {
+            Some(children) => children.push(MenuNode::Item(e)),
+            None => out.push(MenuNode::Submenu { label: folder, children: vec![MenuNode::Item(e)] }),
+        }
+    }
+    (out, empty)
+}
+
 /// Display label of a submenu (the "Assign Shortcut to …" submenus name the current view or
 /// workspace, like After Effects).
 pub fn submenu_label(s: &Session, label: &str, cx: &DynCtx) -> String {
@@ -175,6 +216,9 @@ pub struct MenuEntry {
     #[serde(skip_serializing_if = "Value::is_null")]
     pub params: Value,
     pub shortcut: Option<String>,
+    /// Further default shortcuts (the menus show `shortcut`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub alt_shortcuts: Vec<String>,
 }
 
 impl MenuEntry {
@@ -322,6 +366,9 @@ pub fn checked(s: &Session, command: &str, params: &Value) -> Option<bool> {
         }
         "layer.markersLock" => Some(layer?.markers_locked),
         "layer.mask.hideLocked" => Some(s.state.hide_locked_masks),
+        "view.res.full" | "view.res.half" | "view.res.third" | "view.res.quarter" | "view.res.custom" => {
+            Some(comp.resolution.label().eq_ignore_ascii_case(command.trim_start_matches("view.res.")))
+        }
         "view.layout" => Some(params.get("views").and_then(Value::as_u64) == Some(s.state.view_layout.max(1) as u64)),
         "view.shareViewOptions" => Some(s.state.share_view_options),
         "view.extendedViewer" => Some(s.prefs.three_d.extended_viewer),
@@ -431,8 +478,9 @@ pub fn parse(text: &str, mac: bool) -> Result<Vec<MenuNode>, String> {
                     };
                     // Entries with bound params state their own shortcut; plain entries use the command's.
                     let inherited = if params.is_null() { commands::find(&command).and_then(|c| c.shortcut).map(str::to_string) } else { None };
-                    let shortcut = parts.next().map(|s| s.trim().to_string()).or(inherited);
-                    out.push(MenuNode::Item(MenuEntry { label, command, params, shortcut }));
+                    let mut keys = parts.next().into_iter().flat_map(|s| s.split(", ")).map(|s| s.trim().to_string());
+                    let shortcut = keys.next().or(inherited);
+                    out.push(MenuNode::Item(MenuEntry { label, command, params, shortcut, alt_shortcuts: keys.collect() }));
                 }
                 None => {
                     let children = build(lines, i, depth + 1, mac)?;
@@ -453,8 +501,13 @@ pub fn parse(text: &str, mac: bool) -> Result<Vec<MenuNode>, String> {
 fn effect_categories() -> Vec<MenuNode> {
     let mut cats: Vec<(&str, Vec<MenuNode>)> = vec![];
     for e in crate::effects::all() {
-        let entry =
-            MenuNode::Item(MenuEntry { label: e.name.into(), command: "effect.apply".into(), params: serde_json::json!({"effect": e.id}), shortcut: None });
+        let entry = MenuNode::Item(MenuEntry {
+            label: e.name.into(),
+            command: "effect.apply".into(),
+            params: serde_json::json!({"effect": e.id}),
+            shortcut: None,
+            alt_shortcuts: vec![],
+        });
         match cats.iter_mut().find(|(c, _)| *c == e.category) {
             Some((_, v)) => v.push(entry),
             None => cats.push((e.category, vec![entry])),
@@ -525,8 +578,10 @@ File
     File... | file.import
     Multiple Files... | file.importMultiple
     Adobe Premiere Pro Project... | file.importTimeline
+    EffectCraft Project... | file.importProject
     Placeholder... | file.importPlaceholder
     Solid... | file.importSolid
+    After Effects Project... | file.importAep
     Lottie... | file.importLottie
     Vanishing Point (.vpe)... | file.importVanishingPoint
     Essential Graphics Template... | essential.importTemplate
@@ -537,6 +592,7 @@ File
   Export
     Add to Render Queue | renderQueue.add
     Adobe Premiere Pro Project... | file.exportTimeline
+    After Effects Project... | file.exportAep
     Lottie JSON... | file.exportLottie
     Essential Graphics Template... | essential.exportTemplate
   ---
@@ -553,6 +609,7 @@ File
     Find Missing Effects | file.findMissing {"what":"effects"}
     Find Missing Fonts | file.findMissing {"what":"fonts"}
     Find Missing Footage | file.findMissing {"what":"footage"}
+    Relink Missing Footage... | file.relinkFootage
   Watch Folder... | file.watchFolder
   ---
   Scripts
@@ -561,6 +618,8 @@ File
     Install Script File... | file.installScript
     Install ScriptUI Panel... | file.installScriptUIPanel
     Run Script File... | file.runScript
+    Recent Script Files
+      @dynamic:recentScripts
   ---
   Create Proxy
     Still... | file.createProxy {"kind":"still"}
@@ -646,7 +705,7 @@ Edit
     All 3D Cache... | edit.purge {"what":"3d"}
     Undo | edit.purgeUndo
     Image Cache Memory | edit.purge {"what":"image"}
-    Snapshot | edit.purge {"what":"snapshot"}
+    Snapshot | edit.purge {"what":"snapshot"} | Cmd+Shift+F5
   ---
   Edit Original... | edit.editOriginal
   ---
@@ -692,6 +751,7 @@ Composition
     File... | comp.saveFrameAs
     Photoshop Layers... | comp.saveFrameAsPsd
     ProEXR... | comp.saveFrameAsExr
+  Copy Frame to Clipboard | comp.copyFrame
   Pre-render... | render.preRender
   Save Current Preview... | render.saveCurrentPreview
   ---
@@ -717,6 +777,7 @@ Layer
     Shape Layer | layer.newShape
     Adjustment Layer | layer.newAdjustment
     Content-Aware Fill Layer... | layer.newContentAwareFill
+    3D Primitive... | layer.newPrimitive
     Cube | layer.new3dPrimitive {"kind":"cube"}
     Sphere | layer.new3dPrimitive {"kind":"sphere"}
     Plane | layer.new3dPrimitive {"kind":"plane"}
@@ -770,8 +831,8 @@ Layer
     Draft | layer.quality {"quality":"draft"} | Cmd+Shift+U
     Wireframe | layer.quality {"quality":"wireframe"} | Cmd+Alt+Shift+U
     ---
-    Bilinear | layer.sampling {"sampling":"bilinear"}
-    Bicubic | layer.sampling {"sampling":"bicubic"}
+    Bilinear | layer.sampling {"sampling":"bilinear","toggle":true} | Alt+B
+    Bicubic | layer.sampling {"sampling":"bicubic","toggle":true} | Alt+Shift+B
   Switches
     Hide Other Video | layer.hideOtherVideo
     Show All Video | layer.showAllVideo
@@ -801,6 +862,16 @@ Layer
     Flip Vertical | layer.transform {"op":"flipV"}
     Center In View | layer.transform {"op":"center"} | Cmd+Home
     Center Anchor Point in Layer Content | layer.centerAnchor
+    Quick Set Anchor
+      Top Left | layer.quickSetAnchor {"point":"topLeft"}
+      Top | layer.quickSetAnchor {"point":"top"}
+      Top Right | layer.quickSetAnchor {"point":"topRight"}
+      Left | layer.quickSetAnchor {"point":"left"}
+      Center | layer.quickSetAnchor {"point":"center"}
+      Right | layer.quickSetAnchor {"point":"right"}
+      Bottom Left | layer.quickSetAnchor {"point":"bottomLeft"}
+      Bottom | layer.quickSetAnchor {"point":"bottom"}
+      Bottom Right | layer.quickSetAnchor {"point":"bottomRight"}
     Fit to Comp | layer.transform {"op":"fit"} | Cmd+Alt+F
     Fit to Comp Width | layer.transform {"op":"fitWidth"} | Cmd+Alt+Shift+H
     Fit to Comp Height | layer.transform {"op":"fitHeight"} | Cmd+Alt+Shift+G
@@ -947,14 +1018,20 @@ Layer
     Duplicate and Assign Material | material.duplicateAssign
   Auto-trace... | layer.autoTrace
   Pre-compose... | layer.precompose
+  Un-precompose | layer.unprecompose
   Scene Edit Detection... | layer.sceneEditDetection
 Effect
-  Effect Controls | window.panel {"panel":"effectControls"} | F3
+  Effect Controls | window.panel {"panel":"effectControls"} | F3, Cmd+Shift+T
   Last Effect | effect.applyLast
   Remove All | effect.removeAll
   ---
   Manage Effects... | effect.manage
   Load Effect Plug-in... | effect.plugins.load
+  Install Effect Plug-in... | effect.plugins.install
+  Install Effect Plug-in Bundle (Folder)... | effect.plugins.install {"bundle": true}
+  Load Plug-ins Through Helper... | effect.helpers.load
+  Scan for Effect Helpers | effect.helpers.scan
+  Plug-in Library... | prefs.open {"page":"library"}
   ---
   @effects
 Animation
@@ -977,6 +1054,8 @@ Animation
   ---
   Add Keyframe | anim.addKeyframe
   Toggle Hold Keyframe | keys.toggleHold
+  Mute Keyframes | keys.setMuted
+  Unmute Keyframes | keys.setMuted {"muted":false}
   Keyframe Interpolation... | keys.interpolation
   Keyframe Velocity... | keys.velocity
   Keyframe Assistant
@@ -1020,6 +1099,14 @@ Animation
       Brightness | layer.addTextAnimator {"properties":["strokeBrightness"]}
       Opacity | layer.addTextAnimator {"properties":["strokeOpacity"]}
     Stroke Width | layer.addTextAnimator {"properties":["strokeWidth"]}
+    Front
+      Color | layer.addTextAnimator {"properties":["frontColor"]}
+    Bevel
+      Color | layer.addTextAnimator {"properties":["bevelColor"]}
+    Side
+      Color | layer.addTextAnimator {"properties":["sideColor"]}
+    Back
+      Color | layer.addTextAnimator {"properties":["backColor"]}
     ---
     Tracking | layer.addTextAnimator {"properties":["tracking"]}
     Line Anchor | layer.addTextAnimator {"properties":["lineAnchor"]}
@@ -1093,6 +1180,9 @@ View
   Snap to Guides | view.snapToGuides
   Lock Guides | view.lockGuides
   Add Guide... | view.addGuide
+  Add Percentage Guide... | view.addPercentGuide
+  Convert Guides to Percentage | view.convertGuides {"to":"percent"}
+  Convert Guides to Pixels | view.convertGuides {"to":"pixels"}
   Clear Guides | view.clearGuides
   Import Guides... | view.importGuides
   Export Guides... | view.exportGuides
@@ -1173,7 +1263,7 @@ Window
   Essential Graphics | window.panel {"panel":"essentialGraphics"}
   Info | window.panel {"panel":"info"} | Cmd+2
   Learn | help.inAppTutorials
-  Lumetri Scopes | window.panel {"panel":"lumetriScopes"}
+  Video Scopes | window.panel {"panel":"lumetriScopes"}
   Mask Interpolation | window.panel {"panel":"maskInterpolation"}
   Media Browser | window.panel {"panel":"mediaBrowser"}
   Metadata | window.panel {"panel":"metadata"}
@@ -1190,7 +1280,7 @@ Window
   Wiggler | window.panel {"panel":"wiggler"}
   ---
   Composition | window.panel {"panel":"composition"}
-  Effect Controls | window.panel {"panel":"effectControls"} | F3
+  Effect Controls | window.panel {"panel":"effectControls"} | F3, Cmd+Shift+T
   Flowchart | window.panel {"panel":"flowchart"} | Cmd+F11
   Footage | window.panel {"panel":"footage"}
   Layer | window.panel {"panel":"layer"}
@@ -1200,7 +1290,6 @@ Window
   @dynamic:openViewers
   ---
   Create Nulls From Paths | window.panel {"panel":"createNullsFromPaths"}
-  Ease Presets | window.panel {"panel":"easePresets"}
   VR Comp Editor | window.panel {"panel":"vrCompEditor"}
   @dynamic:scriptPanels
 Help

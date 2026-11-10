@@ -2,101 +2,224 @@ package ai.storyteller.effectcraft;
 
 import android.annotation.SuppressLint;
 import android.app.Activity;
+import android.content.Context;
+import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.ActivityInfo;
-import android.content.res.AssetManager;
-import android.os.Bundle;
-import android.util.Log;
+import android.content.res.Configuration;
 import android.graphics.Color;
-import android.graphics.Typeface;
-import android.view.Gravity;
-import android.view.MotionEvent;
+import android.net.Uri;
+import android.os.Build;
+import android.os.Bundle;
+import android.os.PowerManager;
+import android.os.Process;
+import android.provider.Settings;
+import android.util.Log;
 import android.view.View;
-import android.view.ViewConfiguration;
-import android.view.ViewGroup;
+import android.view.Window;
+import android.view.WindowManager;
+import android.view.inputmethod.InputMethodManager;
 import android.webkit.ConsoleMessage;
 import android.webkit.JavascriptInterface;
-import android.webkit.RenderProcessGoneDetail;
+import android.webkit.PermissionRequest;
 import android.webkit.WebChromeClient;
-import android.webkit.WebResourceError;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceResponse;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
-import android.content.ActivityNotFoundException;
-import android.content.Intent;
-import android.net.Uri;
-import android.webkit.ValueCallback;
 import android.webkit.WebViewClient;
-import android.widget.Button;
 import android.widget.FrameLayout;
-import android.widget.LinearLayout;
-import android.widget.TextView;
 
+import java.io.IOException;
 import java.io.InputStream;
 import java.util.HashMap;
 import java.util.Map;
 
 public class MainActivity extends Activity {
-    private static final String TAG = "EffectCraftPocket";
-    private static final String BASE_URL = "https://effectcraft.app/";
-    private static final int FILE_CHOOSER_REQUEST_CODE = 2001;
+    private static final String TAG = "EffectCraft";
+    private static final String PREFS_NAME = "EffectCraftPrefs";
+    private static final String PREF_MIN_WIDTH = "min_width";
+    private static final String PREF_ZOOM = "ui_zoom";
 
     private WebView webView;
-    private FrameLayout btnFloatingKeyboard;
-    private ValueCallback<Uri[]> filePathCallback;
+    private EffectCraftServer localServer;
+    private int serverPort = 8765;
+    private SharedPreferences prefs;
 
-    // Drag tracking for floating button
-    private float dX, dY;
-    private float startX, startY;
-    private boolean isDragging = false;
-    private int touchSlop;
-
-    @SuppressLint({"SetJavaScriptEnabled", "ClickableViewAccessibility"})
+    @SuppressLint("SetJavaScriptEnabled")
     @Override
     protected void onCreate(Bundle savedInstanceState) {
+        // Unlock 100% CPU & GPU unrestricted performance
+        maximizePerformance();
+
         super.onCreate(savedInstanceState);
 
-        // Safe landscape orientation enforcement
+        prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+
+        // Start embedded HTTP server
         try {
-            setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
-        } catch (Exception e) {
-            Log.w(TAG, "Orientation request ignored: " + e.getMessage());
+            localServer = new EffectCraftServer(getAssets(), serverPort);
+            localServer.start();
+            serverPort = localServer.getPort();
+            Log.i(TAG, "Local server bound to port " + serverPort);
+        } catch (IOException e) {
+            Log.e(TAG, "Failed to start local server, fallback to intercept", e);
         }
 
-        setContentView(R.layout.activity_main);
-        hideSystemUI();
+        // Layout container
+        FrameLayout rootLayout = new FrameLayout(this);
+        rootLayout.setBackgroundColor(Color.parseColor("#1b1c1f"));
 
-        touchSlop = Math.max(ViewConfiguration.get(this).getScaledTouchSlop(), 32);
+        webView = new WebView(this);
+        webView.setBackgroundColor(Color.parseColor("#1b1c1f"));
+        // Force hardware layer for 100% GPU acceleration
+        webView.setLayerType(View.LAYER_TYPE_HARDWARE, null);
 
-        webView = findViewById(R.id.webview);
-        btnFloatingKeyboard = findViewById(R.id.btn_floating_keyboard);
+        configureWebSettings(webView.getSettings());
 
-        setupWebView();
-        setupFloatingButton();
+        webView.addJavascriptInterface(new AndroidBridge(), "AndroidBridge");
 
-        // Load EffectCraft with offline mode flags:
-        // - nosw: disables service worker precaching (all files are already bundled locally in APK)
-        // - noworkers: UI pumps on the main loop, avoiding mobile multi-context GPU driver resets
-        // - home: loads to the clean, fast home dashboard avoiding immediate first-frame 3D shader stall
-        // - webgl: enforces WebGL2 presentation backend for 100% Android WebView compatibility
-        webView.loadUrl(BASE_URL + "index.html?nosw&noworkers&home&webgl");
+        webView.setWebChromeClient(new WebChromeClient() {
+            @Override
+            public boolean onConsoleMessage(ConsoleMessage cm) {
+                Log.d("EffectCraft-JS", cm.message() + " -- From line "
+                        + cm.lineNumber() + " of " + cm.sourceId());
+                return true;
+            }
+
+            @Override
+            public void onPermissionRequest(PermissionRequest request) {
+                request.grant(request.getResources());
+            }
+        });
+
+        webView.setWebViewClient(new WebViewClient() {
+            @Override
+            public void onPageFinished(WebView view, String url) {
+                super.onPageFinished(view, url);
+                applySavedDpiSettings();
+            }
+
+            @Override
+            public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
+                String url = request.getUrl().toString();
+                // If local server is not running or request needs direct asset fallback
+                if (url.startsWith("https://appassets.androidplatform.net/") || localServer == null) {
+                    return handleAssetIntercept(request.getUrl().getPath());
+                }
+                return super.shouldInterceptRequest(view, request);
+            }
+        });
+
+        rootLayout.addView(webView, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+        ));
+
+        setContentView(rootLayout);
+
+        // Load EffectCraft from local HTTP server (secure origin for WebGPU, workers, audio)
+        String entryUrl = "http://127.0.0.1:" + serverPort + "/index.html";
+        webView.loadUrl(entryUrl);
     }
 
-    @Override
-    protected void onResume() {
-        super.onResume();
+    private void maximizePerformance() {
+        Window window = getWindow();
+
+        // 1. Keep screen on and CPU awake at full frequency
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        window.addFlags(WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED);
+
+        // 2. Sustained Performance Mode (locks CPU & GPU clocks, prevents aggressive thermal throttling)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            try {
+                window.setSustainedPerformanceMode(true);
+                Log.i(TAG, "Sustained Performance Mode enabled for 100% CPU/GPU");
+            } catch (Exception e) {
+                Log.w(TAG, "Sustained performance mode not supported on this device", e);
+            }
+        }
+
+        // 3. Process priority
+        try {
+            Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY);
+        } catch (Exception ignored) {}
+
+        // 4. Immersive sticky fullscreen mode
         hideSystemUI();
-        if (webView != null) {
-            webView.onResume();
+    }
+
+    private void hideSystemUI() {
+        View decorView = getWindow().getDecorView();
+        decorView.setSystemUiVisibility(
+                View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                | View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                | View.SYSTEM_UI_FLAG_FULLSCREEN
+        );
+    }
+
+    @SuppressLint("SetJavaScriptEnabled")
+    private void configureWebSettings(WebSettings settings) {
+        settings.setJavaScriptEnabled(true);
+        settings.setDomStorageEnabled(true);
+        settings.setDatabaseEnabled(true);
+        settings.setAllowFileAccess(true);
+        settings.setAllowContentAccess(true);
+        settings.setMediaPlaybackRequiresUserGesture(false);
+
+        // Maximum graphics performance
+        settings.setOffscreenPreRaster(true);
+        settings.setUseWideViewPort(true);
+        settings.setLoadWithOverviewMode(true);
+        settings.setSupportZoom(true);
+        settings.setBuiltInZoomControls(false);
+        settings.setDisplayZoomControls(false);
+
+        // High priority cache
+        settings.setCacheMode(WebSettings.LOAD_DEFAULT);
+
+        // Enable cross-origin features where possible
+        try {
+            settings.setAllowUniversalAccessFromFileURLs(true);
+            settings.setAllowFileAccessFromFileURLs(true);
+        } catch (Exception ignored) {}
+    }
+
+    private WebResourceResponse handleAssetIntercept(String path) {
+        if (path == null) return null;
+        if (path.startsWith("/")) path = path.substring(1);
+        if (path.isEmpty()) path = "index.html";
+
+        String assetPath = "web/" + path;
+        try {
+            InputStream is = getAssets().open(assetPath);
+            String mime = "application/octet-stream";
+            if (path.endsWith(".html")) mime = "text/html";
+            else if (path.endsWith(".wasm")) mime = "application/wasm";
+            else if (path.endsWith(".js")) mime = "application/javascript";
+            else if (path.endsWith(".css")) mime = "text/css";
+            else if (path.endsWith(".svg")) mime = "image/svg+xml";
+            else if (path.endsWith(".png")) mime = "image/png";
+
+            Map<String, String> headers = new HashMap<>();
+            headers.put("Cross-Origin-Opener-Policy", "same-origin");
+            headers.put("Cross-Origin-Embedder-Policy", "require-corp");
+            headers.put("Access-Control-Allow-Origin", "*");
+
+            return new WebResourceResponse(mime, "utf-8", 200, "OK", headers, is);
+        } catch (IOException e) {
+            return null;
         }
     }
 
-    @Override
-    protected void onPause() {
-        super.onPause();
-        if (webView != null) {
-            webView.onPause();
-        }
+    private void applySavedDpiSettings() {
+        int minWidth = prefs.getInt(PREF_MIN_WIDTH, 1080);
+        float zoom = prefs.getFloat(PREF_ZOOM, 1.0f);
+        String js = String.format("window.__applyDpiSettings && window.__applyDpiSettings(%d, %f);", minWidth, zoom);
+        webView.post(() -> webView.evaluateJavascript(js, null));
     }
 
     @Override
@@ -107,335 +230,102 @@ public class MainActivity extends Activity {
         }
     }
 
-    private void hideSystemUI() {
-        try {
-            View decorView = getWindow().getDecorView();
-            decorView.setSystemUiVisibility(
-                    View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
-                    | View.SYSTEM_UI_FLAG_LAYOUT_STABLE
-                    | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
-                    | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
-                    | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
-                    | View.SYSTEM_UI_FLAG_FULLSCREEN
-            );
-        } catch (Exception ignored) {}
-    }
-
-    @SuppressLint("SetJavaScriptEnabled")
-    private void setupWebView() {
-        WebSettings settings = webView.getSettings();
-        settings.setJavaScriptEnabled(true);
-        settings.setDomStorageEnabled(true);
-        settings.setDatabaseEnabled(true);
-        settings.setMediaPlaybackRequiresUserGesture(false);
-        settings.setAllowFileAccess(true);
-        settings.setAllowContentAccess(true);
-        settings.setUseWideViewPort(true);
-        settings.setLoadWithOverviewMode(true);
-        settings.setSupportZoom(false);
-        settings.setCacheMode(WebSettings.LOAD_DEFAULT);
-        settings.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
-        settings.setJavaScriptCanOpenWindowsAutomatically(true);
-        settings.setUserAgentString(settings.getUserAgentString() + " EffectCraftPocketApp/0.6.0");
-
-        webView.addJavascriptInterface(new AndroidBridge(), "AndroidBridge");
-
-        webView.setWebChromeClient(new WebChromeClient() {
-            @Override
-            public boolean onConsoleMessage(ConsoleMessage cm) {
-                Log.d(TAG, "[Console] " + cm.message() + " -- Line "
-                        + cm.lineNumber() + " of " + cm.sourceId());
-                return true;
-            }
-
-            @Override
-            public boolean onShowFileChooser(WebView webView, ValueCallback<Uri[]> callback, FileChooserParams params) {
-                if (filePathCallback != null) {
-                    filePathCallback.onReceiveValue(null);
-                    filePathCallback = null;
-                }
-                filePathCallback = callback;
-
-                Intent intent = null;
-                if (params != null) {
-                    try {
-                        intent = params.createIntent();
-                    } catch (Exception ignored) {}
-                }
-                if (intent == null) {
-                    intent = new Intent(Intent.ACTION_GET_CONTENT);
-                    intent.addCategory(Intent.CATEGORY_OPENABLE);
-                    intent.setType("*/*");
-                }
-                intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
-
-                try {
-                    startActivityForResult(Intent.createChooser(intent, "Import Media or Project"), FILE_CHOOSER_REQUEST_CODE);
-                } catch (ActivityNotFoundException e) {
-                    Log.e(TAG, "Cannot open file chooser: " + e.getMessage());
-                    if (filePathCallback != null) {
-                        filePathCallback.onReceiveValue(null);
-                        filePathCallback = null;
-                    }
-                    return false;
-                }
-                return true;
-            }
-        });
-
-        webView.setWebViewClient(new WebViewClient() {
-            @Override
-            public boolean onRenderProcessGone(WebView view, RenderProcessGoneDetail detail) {
-                boolean didCrash = detail != null && detail.didCrash();
-                int priority = detail != null ? detail.rendererPriorityAtExit() : -1;
-                Log.e(TAG, "WebView render process exited: didCrash=" + didCrash +
-                        ", priority=" + priority);
-                runOnUiThread(() -> {
-                    handleRendererCrashed(didCrash, priority);
-                });
-                return true;
-            }
-
-            @Override
-            public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
-                Log.e(TAG, "WebView error: " + error.getErrorCode() + " - " + error.getDescription()
-                        + " URL: " + request.getUrl());
-            }
-
-            @Override
-            public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
-                String url = request.getUrl().toString();
-                if (url.startsWith(BASE_URL)) {
-                    String path = url.substring(BASE_URL.length());
-                    int queryIdx = path.indexOf('?');
-                    if (queryIdx >= 0) {
-                        path = path.substring(0, queryIdx);
-                    }
-                    int hashIdx = path.indexOf('#');
-                    if (hashIdx >= 0) {
-                        path = path.substring(0, hashIdx);
-                    }
-                    if (path.isEmpty() || path.equals("/")) {
-                        path = "index.html";
-                    }
-
-                    try {
-                        AssetManager am = getAssets();
-                        InputStream is = am.open("web/" + path);
-                        long length = -1;
-                        try {
-                            length = is.available();
-                        } catch (Exception ignored) {}
-
-                        String mimeType = getMimeType(path);
-                        String encoding = (mimeType.startsWith("text/")
-                                || mimeType.equals("application/javascript")
-                                || mimeType.equals("application/json")) ? "utf-8" : null;
-
-                        Map<String, String> headers = new HashMap<>();
-                        headers.put("Content-Type", mimeType + (encoding != null ? "; charset=" + encoding : ""));
-                        if (length > 0) {
-                            headers.put("Content-Length", String.valueOf(length));
-                        }
-                        headers.put("Access-Control-Allow-Origin", "*");
-                        headers.put("Cache-Control", "no-cache");
-
-                        return new WebResourceResponse(mimeType, encoding, 200, "OK", headers, is);
-                    } catch (Exception e) {
-                        Log.w(TAG, "Asset not found: web/" + path + " (" + e.getMessage() + ")");
-                        return new WebResourceResponse("text/plain", "utf-8", 404, "Not Found", null, null);
-                    }
-                }
-                return super.shouldInterceptRequest(view, request);
-            }
-        });
-    }
-
-    private String getMimeType(String path) {
-        if (path.endsWith(".html")) return "text/html";
-        if (path.endsWith(".js") || path.endsWith(".mjs")) return "application/javascript";
-        if (path.endsWith(".wasm")) return "application/wasm";
-        if (path.endsWith(".css")) return "text/css";
-        if (path.endsWith(".json") || path.endsWith(".webmanifest")) return "application/json";
-        if (path.endsWith(".png")) return "image/png";
-        if (path.endsWith(".svg")) return "image/svg+xml";
-        if (path.endsWith(".ico")) return "image/x-icon";
-        if (path.endsWith(".woff2")) return "font/woff2";
-        if (path.endsWith(".ttf")) return "font/ttf";
-        return "application/octet-stream";
-    }
-
-    private long btnDownTime = 0;
-
-    @SuppressLint("ClickableViewAccessibility")
-    private void setupFloatingButton() {
-        btnFloatingKeyboard.setOnClickListener(v -> toggleKeyboard());
-
-        btnFloatingKeyboard.setOnTouchListener((view, event) -> {
-            switch (event.getAction()) {
-                case MotionEvent.ACTION_DOWN:
-                    dX = view.getX() - event.getRawX();
-                    dY = view.getY() - event.getRawY();
-                    startX = event.getRawX();
-                    startY = event.getRawY();
-                    btnDownTime = System.currentTimeMillis();
-                    isDragging = false;
-                    return true;
-
-                case MotionEvent.ACTION_MOVE:
-                    float deltaX = event.getRawX() - startX;
-                    float deltaY = event.getRawY() - startY;
-                    double distance = Math.hypot(deltaX, deltaY);
-
-                    if (distance > Math.max(touchSlop * 2, 48)) {
-                        isDragging = true;
-                    }
-
-                    if (isDragging) {
-                        float newX = event.getRawX() + dX;
-                        float newY = event.getRawY() + dY;
-
-                        View parent = (View) view.getParent();
-                        if (parent != null) {
-                            float maxX = parent.getWidth() - view.getWidth();
-                            float maxY = parent.getHeight() - view.getHeight();
-                            view.setX(Math.max(0, Math.min(newX, maxX)));
-                            view.setY(Math.max(0, Math.min(newY, maxY)));
-                        }
-                    }
-                    return true;
-
-                case MotionEvent.ACTION_UP:
-                    long elapsed = System.currentTimeMillis() - btnDownTime;
-                    double totalDist = Math.hypot(event.getRawX() - startX, event.getRawY() - startY);
-                    if (!isDragging || (elapsed < 350 && totalDist < 60)) {
-                        toggleKeyboard();
-                    }
-                    isDragging = false;
-                    return true;
-
-                default:
-                    return false;
-            }
-        });
-    }
-
-    public void toggleKeyboard() {
-        if (webView != null) {
-            runOnUiThread(() -> {
-                webView.evaluateJavascript(
-                    "(function() {" +
-                    "  if (typeof window.toggleVirtualKeyboard === 'function') {" +
-                    "    window.toggleVirtualKeyboard();" +
-                    "  } else if (typeof window.showVirtualKeyboard === 'function') {" +
-                    "    window.showVirtualKeyboard();" +
-                    "  } else {" +
-                    "    var kb = document.getElementById('ec-keyboard-container');" +
-                    "    if (kb) kb.classList.toggle('ec-kb-hidden');" +
-                    "  }" +
-                    "})();",
-                    null
-                );
-            });
-        }
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (webView != null) webView.onResume();
+        hideSystemUI();
     }
 
     @Override
-    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
-        super.onActivityResult(requestCode, resultCode, data);
-        if (requestCode == FILE_CHOOSER_REQUEST_CODE) {
-            if (filePathCallback != null) {
-                Uri[] results = null;
-                if (resultCode == Activity.RESULT_OK && data != null) {
-                    if (data.getClipData() != null) {
-                        int count = data.getClipData().getItemCount();
-                        results = new Uri[count];
-                        for (int i = 0; i < count; i++) {
-                            results[i] = data.getClipData().getItemAt(i).getUri();
-                        }
-                    } else if (data.getData() != null) {
-                        results = new Uri[]{ data.getData() };
-                    }
-                }
-                filePathCallback.onReceiveValue(results);
-                filePathCallback = null;
-            }
-        }
+    protected void onPause() {
+        super.onPause();
+        // Keep timers running if rendering
+        if (webView != null) webView.onResume();
     }
 
-    private void handleRendererCrashed(boolean didCrash, int priority) {
-        FrameLayout root = findViewById(R.id.root_container);
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        if (localServer != null) {
+            localServer.stop();
+        }
         if (webView != null) {
-            if (root != null) {
-                root.removeView(webView);
-            }
-            try {
-                webView.destroy();
-            } catch (Exception ignored) {}
-            webView = null;
+            webView.destroy();
         }
-
-        if (root == null) return;
-
-        LinearLayout recoveryLayout = new LinearLayout(this);
-        recoveryLayout.setOrientation(LinearLayout.VERTICAL);
-        recoveryLayout.setGravity(Gravity.CENTER);
-        recoveryLayout.setBackgroundColor(Color.parseColor("#1b1c1f"));
-        recoveryLayout.setPadding(48, 48, 48, 48);
-
-        TextView title = new TextView(this);
-        title.setText("EffectCraft");
-        title.setTextColor(Color.parseColor("#e3e3e3"));
-        title.setTextSize(24);
-        title.setTypeface(null, Typeface.BOLD);
-        title.setGravity(Gravity.CENTER);
-        recoveryLayout.addView(title);
-
-        TextView msg = new TextView(this);
-        msg.setText("Graphics renderer was reset or memory was reclaimed by the system.\n(didCrash=" + didCrash + ", priority=" + priority + ")");
-        msg.setTextColor(Color.parseColor("#9ea1ad"));
-        msg.setTextSize(14);
-        msg.setGravity(Gravity.CENTER);
-        msg.setPadding(0, 16, 0, 32);
-        recoveryLayout.addView(msg);
-
-        Button btnRestart = new Button(this);
-        btnRestart.setText("Restart EffectCraft");
-        btnRestart.setBackgroundColor(Color.parseColor("#2d8ceb"));
-        btnRestart.setTextColor(Color.WHITE);
-        btnRestart.setPadding(32, 16, 32, 16);
-        btnRestart.setOnClickListener(v -> {
-            root.removeView(recoveryLayout);
-            recreateWebView(root);
-        });
-        recoveryLayout.addView(btnRestart);
-
-        root.addView(recoveryLayout, 0, new FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
-    }
-
-    private void recreateWebView(FrameLayout root) {
-        webView = new WebView(this);
-        root.addView(webView, 0, new FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
-        setupWebView();
-        webView.loadUrl(BASE_URL + "index.html?nosw&noworkers&home&webgl&empty");
     }
 
     public class AndroidBridge {
         @JavascriptInterface
-        public void log(String tag, String msg) {
-            Log.d(TAG, "[JS-" + tag + "] " + msg);
+        public void showSoftKeyboard() {
+            runOnUiThread(() -> {
+                if (webView != null) {
+                    webView.requestFocus();
+                    InputMethodManager imm = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+                    if (imm != null) {
+                        imm.showSoftInput(webView, InputMethodManager.SHOW_IMPLICIT);
+                    }
+                }
+            });
         }
 
         @JavascriptInterface
-        public void reportError(String error, String stack) {
-            Log.e(TAG, "[JS-Error] " + error + "\n" + stack);
+        public void hideSoftKeyboard() {
+            runOnUiThread(() -> {
+                if (webView != null) {
+                    InputMethodManager imm = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+                    if (imm != null) {
+                        imm.hideSoftInputFromWindow(webView.getWindowToken(), 0);
+                    }
+                }
+            });
         }
 
         @JavascriptInterface
-        public void onAppReady() {
-            Log.i(TAG, "[JS] EffectCraft canvas is ready and running!");
+        public void saveDpiSettings(int minWidth, float zoom) {
+            prefs.edit()
+                    .putInt(PREF_MIN_WIDTH, minWidth)
+                    .putFloat(PREF_ZOOM, zoom)
+                    .apply();
+            Log.i(TAG, "Saved DPI Settings: minWidth=" + minWidth + "dp, zoom=" + zoom);
+        }
+
+        @JavascriptInterface
+        public int getSavedMinWidth() {
+            return prefs.getInt(PREF_MIN_WIDTH, 1080);
+        }
+
+        @JavascriptInterface
+        public float getSavedZoom() {
+            return prefs.getFloat(PREF_ZOOM, 1.0f);
+        }
+
+        @JavascriptInterface
+        public int getCpuCores() {
+            return Runtime.getRuntime().availableProcessors();
+        }
+
+        @JavascriptInterface
+        public long getTotalRamMb() {
+            return Runtime.getRuntime().maxMemory() / (1024 * 1024);
+        }
+
+        @JavascriptInterface
+        public void requestIgnoreBatteryOptimizations() {
+            runOnUiThread(() -> {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    try {
+                        PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+                        if (pm != null && !pm.isIgnoringBatteryOptimizations(getPackageName())) {
+                            Intent intent = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
+                            intent.setData(Uri.parse("package:" + getPackageName()));
+                            startActivity(intent);
+                        }
+                    } catch (Exception e) {
+                        Log.e(TAG, "Failed to request battery exemption", e);
+                    }
+                }
+            });
         }
     }
 }

@@ -7,23 +7,33 @@
 //!   memory-budgeted LRU frame cache, one decoder per source, and the decoder kept positioned for
 //!   sequential playback. Also audio ([`MediaPool::audio_samples`]) and thumbnails.
 //!
-//! Video containers (MP4/MOV, Matroska/WebM) and codecs (H.264, HEVC, VP9, AV1, ProRes, DNxHD,
-//! MJPEG; AAC, Opus, PCM, MP3/FLAC/Vorbis) come from FilmCraft's pure-Rust crates (git dependency,
+//! Video containers (MP4/MOV, Matroska/WebM, MXF OP1a / OP-Atom) and codecs (H.264, HEVC, VP9,
+//! AV1, ProRes, DNxHD, MPEG-2, MJPEG; AAC, Opus, PCM, MP3/FLAC/Vorbis) come from FilmCraft's pure-Rust crates (git dependency,
 //! pinned; `plan/adr/0001`). FilmCraft types never leave this crate. Stills use the `image` crate
-//! (PNG, JPEG, GIF, WebP, TIFF, BMP, OpenEXR); Photoshop documents (merged image or one layer) come
+//! (PNG, JPEG, GIF, WebP, TIFF, BMP, OpenEXR, Targa, Radiance HDR); Photoshop documents (merged image or one layer) come
 //! from `effectcraft-psd` and SVG from `effectcraft-svg` (rasterised at any scale).
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+mod aac;
 mod convert;
+pub mod downmix;
+mod dpx;
 pub mod exr_channels;
+mod gif_anim;
 mod layered;
 pub use layered::vector_doc;
 mod pool;
 mod probe;
+mod reads;
+mod stream;
+mod wav_markers;
+mod webp_anim;
 
+/// Video decoder counters (time in decoders, samples decoded, seeks, cache hits), for benchmarks.
+pub use filmcraft_codecs::{GopStats, gop_stats};
 pub use pool::{DEFAULT_BUDGET, MediaPool, PoolStats};
-pub use probe::{DEFAULT_SEQUENCE_RATE, probe, probe_bytes, probe_model, probe_single, sequence_files};
+pub use probe::{DEFAULT_SEQUENCE_RATE, probe, probe_bytes, probe_model};
 
 /// Errors from probing or decoding footage.
 #[derive(Debug, thiserror::Error)]
@@ -34,6 +44,9 @@ pub enum MediaError {
     Unsupported(String),
     #[error("decode error: {0}")]
     Decode(String),
+    /// The read was called off before it finished (see [`effectcraft_render::FootageSource::cancellable`]).
+    #[error("cancelled")]
+    Cancelled,
 }
 
 pub type Result<T> = std::result::Result<T, MediaError>;
@@ -44,20 +57,21 @@ impl From<filmcraft_media::MediaError> for MediaError {
         match e {
             F::Unsupported(s) => MediaError::Unsupported(s),
             F::Io(s) | F::Offline(s) => MediaError::Io(s),
+            F::Cancelled => MediaError::Cancelled,
             other => MediaError::Decode(other.to_string()),
         }
     }
 }
 
 /// File extensions recognised as stills.
-pub const STILL_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "tif", "tiff", "bmp", "exr", "psd", "psb", "svg", "pdf", "ai", "eps"];
+pub const STILL_EXTENSIONS: &[&str] =
+    &["png", "jpg", "jpeg", "gif", "webp", "tif", "tiff", "bmp", "exr", "tga", "hdr", "psd", "psb", "svg", "pdf", "ai", "eps"];
 /// File extensions recognised as audio-only files.
 pub const AUDIO_EXTENSIONS: &[&str] = filmcraft_media::AUDIO_EXTENSIONS;
-/// File extensions recognised as movies.
-pub const VIDEO_EXTENSIONS: &[&str] = &["mp4", "m4v", "mov", "mkv", "webm"];
+pub use effectcraft_project::VIDEO_EXTENSIONS;
 
 /// File extensions recognised as 3D models (Advanced 3D model layers).
-pub const MODEL_EXTENSIONS: &[&str] = &["gltf", "glb", "obj"];
+pub const MODEL_EXTENSIONS: &[&str] = &["gltf", "glb", "obj", "stl", "fbx"];
 
 /// Whether `path` has an extension we can import.
 pub fn is_importable(path: &std::path::Path) -> bool {
@@ -66,12 +80,82 @@ pub fn is_importable(path: &std::path::Path) -> bool {
         || STILL_EXTENSIONS.contains(&ext.as_str())
         || AUDIO_EXTENSIONS.contains(&ext.as_str())
         || VIDEO_EXTENSIONS.contains(&ext.as_str())
+        || dpx::EXTENSIONS.contains(&ext.as_str())
+}
+
+/// A whole file's bytes, refusing anything that isn't a regular file: a project can name
+/// `/dev/zero` or a FIFO as footage, and reading those never ends (#2134).
+pub(crate) fn read_regular_file(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    read_regular_file_stamped(path).map(|(bytes, _)| bytes)
+}
+
+/// [`read_regular_file`] with the file's identity, from the metadata of the open file (no
+/// second look at the path).
+pub(crate) fn read_regular_file_stamped(path: &std::path::Path) -> std::io::Result<(Vec<u8>, effectcraft_render::reads::FileStamp)> {
+    use std::io::Read;
+    #[cfg(test)]
+    count_open(path);
+    let mut file = std::fs::File::open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{} is not a file", path.display())));
+    }
+    let mut bytes = Vec::new();
+    // A sparse file can claim far more than memory: an error, not an abort.
+    bytes.try_reserve_exact(usize::try_from(meta.len()).unwrap_or(usize::MAX)).map_err(|e| std::io::Error::new(std::io::ErrorKind::OutOfMemory, e))?;
+    file.read_to_end(&mut bytes)?;
+    Ok((bytes, effectcraft_render::reads::FileStamp::of_metadata(&meta)))
+}
+
+#[cfg(test)]
+static OPENS: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// Count an open of a file (tests: which files a render touched on disk).
+#[cfg(test)]
+pub(crate) fn count_open(path: &std::path::Path) {
+    OPENS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(path.to_path_buf());
+}
+
+/// How many times files under `dir` were opened so far (tests).
+#[cfg(test)]
+pub(crate) fn opens_under(dir: &std::path::Path) -> usize {
+    OPENS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().filter(|p| p.starts_with(dir)).count()
 }
 
 pub(crate) fn ext_of(path: &std::path::Path) -> String {
-    path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase()
+    path.extension().and_then(std::ffi::OsStr::to_str).unwrap_or("").to_ascii_lowercase()
+}
+
+/// The `image` crate format of a still: from its signature, else from its extension (Targa has
+/// no signature; a `.hdr` without the Radiance one then fails with the decoder's own error).
+pub(crate) fn still_format(path: &str, bytes: &[u8]) -> Option<image::ImageFormat> {
+    if let Ok(fmt) = image::guess_format(bytes) {
+        return Some(fmt);
+    }
+    match ext_of(std::path::Path::new(path)).as_str() {
+        "tga" => Some(image::ImageFormat::Tga),
+        "hdr" => Some(image::ImageFormat::Hdr),
+        _ => None,
+    }
 }
 
 pub(crate) fn rate_from_fc(r: filmcraft_time::FrameRate) -> effectcraft_time::FrameRate {
     if r.num > 0 && r.den > 0 { effectcraft_time::FrameRate::new(r.num, r.den) } else { effectcraft_time::FrameRate::FPS_30 }
+}
+
+#[cfg(test)]
+mod read_tests {
+    /// #2134: a folder (and on Unix a device) named as footage is an error, not an endless read.
+    #[test]
+    fn only_regular_files_are_read_whole() {
+        let dir = std::env::temp_dir();
+        assert!(super::read_regular_file(&dir).is_err());
+        assert!(crate::probe::probe(&dir).is_err(), "probing a folder fails instead of reading it");
+        #[cfg(unix)]
+        assert!(super::read_regular_file(std::path::Path::new("/dev/zero")).is_err());
+        let f = dir.join(format!("ec-read-regular-{}.bin", std::process::id()));
+        std::fs::write(&f, b"abc").unwrap();
+        assert_eq!(super::read_regular_file(&f).unwrap(), b"abc");
+        let _ = std::fs::remove_file(f);
+    }
 }

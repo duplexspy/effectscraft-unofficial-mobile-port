@@ -1,0 +1,7 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <style name="Theme.EffectCraft" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="android:statusBarColor">#1b1c1f</item>
+        <item name="android:navigationBarColor">#1b1c1f</item>
+        <item name="android:windowBackground">#1b1c1f</item>
+    </style>
+</resources>

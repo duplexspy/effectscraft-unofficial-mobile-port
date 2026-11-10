@@ -1,40 +1,46 @@
-# EffectCraft Android Mobile Port
+# EffectCraft Android Mobile Port (v0.23.1 Pocket)
 
-This directory contains the complete native Android wrapper, build configuration, and assets for running **EffectCraft** on Android mobile devices and tablets.
+This directory contains the complete native Android wrapper, build configuration, and assets for running **EffectCraft v0.23.1** on Android mobile devices and tablets, ported and maintained by **@duplexspy**.
 
-## Architecture
+## Architecture & Features
 
-1. **Native Shell (`MainActivity.java`)**:
-   - Immersive full-screen sticky landscape mode (`sensorLandscape`).
-   - Hardware-accelerated `WebView` acting as a secure local runtime host.
-   - Offline asset streaming via `shouldInterceptRequest` serving bundled WebAssembly and JavaScript assets directly from APK storage without requiring an external internet connection.
-   - Low-latency touch-slop gesture handling for the floating virtual keyboard trigger.
+1. **Native Shell (`MainActivity.java` & `EffectCraftServer.java`)**:
+   - Hardware-accelerated runtime (`android:hardwareAccelerated="true"` and `View.LAYER_TYPE_HARDWARE`).
+   - Built-in multi-threaded embedded HTTP server (`127.0.0.1`) serving WebAssembly and assets with `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp` headers to unlock `SharedArrayBuffer` and high-performance Web Workers.
+   - Dual-path offline streaming: direct embedded local server with redundant `shouldInterceptRequest` asset streaming fallback.
+   - Immersive full-screen sticky mode maximizing editing space.
 
-2. **Core Engine**:
-   - Original pure-Rust engine compiled to `wasm32-unknown-unknown` and optimized for mobile memory constraints.
-   - Progressive WebAssembly streaming via `WebAssembly.compileStreaming` with uncompressed `.wasm` storage (`noCompress 'wasm'`) to eliminate on-the-fly decompression memory pressure.
+2. **Chiclet Virtual Laptop Keyboard (`mobile.js`, `mobile.css`)**:
+   - Floating draggable toggle button.
+   - **Quick VFX Action Bar**:
+     - Latching modifier keys (`Ctrl`, `Alt`, `Shift`) with illuminated toggle state.
+     - Playback & Pan: Tap `Space` to Play/Pause; **hold `Space` to Pan** the composition viewer with a second touch.
+     - Dedicated editing shortcuts: `Undo` (Ctrl+Z), `Redo` (Ctrl+Y), `Del`, `Esc`, `Enter`, `Tab`.
+     - Tool selectors: `V` (Select), `H` (Hand), `Z` (Zoom), `T` (Text), `G` (Pen/Mask), `Y` (Pan Behind).
+     - Timeline navigation: `◄ J` (Previous Keyframe), `K ►` (Next Keyframe).
+     - Nudge cluster: Arrow keys `▲`, `▼`, `◀`, `▶` (hold Shift for 10px nudges).
+   - **Full Virtual QWERTY Keyboard**: Slide-up on-screen touch keyboard with numbers, symbols, Backspace, Enter, Esc, and Space.
+   - **Native Soft Keyboard (IME) Summoner**: Dedicated text input bar integrating Android system keyboards via `InputMethodManager.showSoftInput`.
 
-3. **Virtual Laptop Keyboard (`keyboard.js`, `keyboard.css`)**:
-   - Draggable floating trigger button.
-   - Full virtual laptop chiclet keyboard featuring:
-     - Function row (Esc, F1–F12).
-     - Standard numbers and symbols.
-     - Full QWERTY layout with Caps Lock.
-     - Latching and sticky modifier keys (Ctrl, Alt, Shift, Win) supporting shortcuts (`Ctrl+Z`, `Ctrl+S`, `Ctrl+Y`, etc.).
-     - Dedicated navigation cluster (Insert, Home, PgUp, Del, End, PgDn, Arrows).
-     - Functional dedicated Number Pad (Numpad) with NumLock toggle.
-   - Dual-dispatch input engine: broadcasts standard DOM `KeyboardEvent`s and dispatches directly to the egui control bus via `window.effectcraft.request('ui.key')` and `ui.type`.
+3. **DPI & Minimum Width Settings**:
+   - Floating Settings dialog (`⚙️`) allowing real-time viewport configuration.
+   - **Presets**: Phone (480 dp), Phablet (720 dp), Tablet (960 dp), Desktop HD (1080 dp), Studio Pro (1280 dp), UltraWide (1440 dp).
+   - **Continuous Sliders**: Custom Minimum Width from 360 dp to 1920 dp, and UI Scale / Density Zoom from 50% to 200%.
+   - Persistent settings saved across launches via `localStorage` and `SharedPreferences`.
 
-4. **Mouse & Touch Support**:
-   - Preserves all desktop interactions (clicking, dragging, zooming, scrubbing timeline keyframes, text selection).
+4. **100% CPU & GPU Unrestricted Performance**:
+   - `setSustainedPerformanceMode(true)` on Android 7.0+ to lock peak CPU and GPU frequencies and prevent thermal downclocking.
+   - Window `FLAG_KEEP_SCREEN_ON` and screen WakeLock API to keep processors active during heavy renders.
+   - Priority boost via `Process.THREAD_PRIORITY_URGENT_DISPLAY`.
+   - `setOffscreenPreRaster(true)` for multi-threaded rasterization across all logical CPU cores (`navigator.hardwareConcurrency`).
+   - One-tap Request Battery Optimization Exemption for unrestricted background renders.
 
 ## Building
 
 ```bash
 cd packaging/android
-/opt/gradle/gradle-8.14.3/bin/gradle assembleRelease bundleRelease
+gradle assembleDebug
 ```
 
-Build outputs:
-- Release APK: `app/build/outputs/apk/release/app-release.apk`
-- App Bundle: `app/build/outputs/bundle/release/app-release.aab`
+Output:
+- Debug APK: `app/build/outputs/apk/debug/app-debug.apk`

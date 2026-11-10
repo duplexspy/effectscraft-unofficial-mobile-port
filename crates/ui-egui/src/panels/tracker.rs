@@ -51,8 +51,10 @@ fn current(app: &EffectcraftApp) -> Option<(LayerId, Uid)> {
     l.trackers().next().map(|(g, _)| (l.id, g.uid))
 }
 
+/// The `egui::Id` of the Motion Source dropdown's transient state; picking a new source removes
+/// whatever is stored under it, so the choice starts fresh.
 fn source_id() -> egui::Id {
-    egui::Id::new("tracker-motion-source")
+    egui::Id::unique("tracker-motion-source")
 }
 
 /// Motion Source: the current track's layer, the chosen source, or the selected layer.
@@ -88,7 +90,7 @@ fn button(app: &mut EffectcraftApp, ui: &mut egui::Ui, r: Rect, text: &str, enab
         ui.painter().text(r.center(), Align2::CENTER_CENTER, text, Tokens::medium(12.0), t.text_faint);
         return false;
     }
-    widgets::text_button(ui, r, text, false, &t, egui::Id::new(id)).clicked()
+    widgets::text_button(ui, r, text, false, &t, egui::Id::unique(id)).clicked()
 }
 
 fn run(app: &mut EffectcraftApp, ctx: &egui::Context, cmd: &str, p: serde_json::Value) {
@@ -113,6 +115,37 @@ fn analyze_glyph(p: &egui::Painter, r: Rect, forward: bool, frame: bool, stop: b
     }
 }
 
+/// The two button rows at `y`: Track Camera / Warp Stabilizer, then Track Motion / Stabilize Motion.
+fn top_buttons(app: &mut EffectcraftApp, ui: &mut egui::Ui, ctx: &egui::Context, x0: f32, y: f32, half: f32, source: Option<LayerId>) {
+    let can_track = app.session.active_comp().is_some() && source.is_some();
+    // Track Camera / Warp Stabilizer and Track Motion / Stabilize Motion.
+    let r1 = Rect::from_min_size(pos2(x0, y), vec2(half, 22.0));
+    let r2 = Rect::from_min_size(pos2(x0 + half + 6.0, y), vec2(half, 22.0));
+    let src_p = source.map(|l| json!({"layer": l.0})).unwrap_or_else(|| json!({}));
+    let can_camera = app.session.is_enabled("track.camera") && !app.session.is_camera_analyzing();
+    if button(app, ui, r1, "Track Camera", can_camera, "tracker.trackCamera") {
+        run(app, ctx, "track.camera", json!({}));
+    }
+    let can_warp = app.session.is_enabled("track.warpStabilizer") && !app.session.is_warp_analyzing();
+    if button(app, ui, r2, "Warp Stabilizer", can_warp, "tracker.warpStabilizer") {
+        run(app, ctx, "track.warpStabilizer", json!({}));
+    }
+    let y = y + 28.0;
+    let r1 = Rect::from_min_size(pos2(x0, y), vec2(half, 22.0));
+    let r2 = Rect::from_min_size(pos2(x0 + half + 6.0, y), vec2(half, 22.0));
+    if button(app, ui, r1, "Track Motion", can_track, "tracker.trackMotion") {
+        run(app, ctx, "track.motion", src_p.clone());
+    }
+    if button(app, ui, r2, "Stabilize Motion", can_track, "tracker.stabilizeMotion") {
+        run(app, ctx, "track.stabilize", src_p.clone());
+    }
+}
+
+/// The Tracker panel: the camera/warp and motion/stabilize buttons, Motion Source and Current
+/// Track pickers, the track type and its channels, Motion Target with Edit Target and Options, the
+/// four Analyze buttons (the one whose direction is running offers Stop), Reset and Apply, and the
+/// analysis progress. With a mask selected it switches to its mask-tracking mode. Every change runs a
+/// `track.*` command; while an analysis is running it polls the job and asks for repaints.
 pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let t = app.tokens;
     let ctx = ui.ctx().clone();
@@ -125,35 +158,13 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let w = (rect.width() - 20.0).max(120.0);
     let half = (w - 6.0) / 2.0;
     let mut y = rect.min.y + 10.0;
-    let has_comp = app.session.active_comp().is_some();
     let source = motion_source(app);
     let cur = current(app);
-    let can_track = has_comp && source.is_some();
 
-    // Track Camera / Warp Stabilizer and Track Motion / Stabilize Motion.
-    let r1 = Rect::from_min_size(pos2(x0, y), vec2(half, 22.0));
-    let r2 = Rect::from_min_size(pos2(x0 + half + 6.0, y), vec2(half, 22.0));
-    let src_p = source.map(|l| json!({"layer": l.0})).unwrap_or_else(|| json!({}));
-    let can_camera = app.session.is_enabled("track.camera") && !app.session.is_camera_analyzing();
-    if button(app, ui, r1, "Track Camera", can_camera, "tracker.trackCamera") {
-        run(app, &ctx, "track.camera", json!({}));
-    }
-    let can_warp = app.session.is_enabled("track.warpStabilizer") && !app.session.is_warp_analyzing();
-    if button(app, ui, r2, "Warp Stabilizer", can_warp, "tracker.warpStabilizer") {
-        run(app, &ctx, "track.warpStabilizer", json!({}));
-    }
-    y += 28.0;
-    let r1 = Rect::from_min_size(pos2(x0, y), vec2(half, 22.0));
-    let r2 = Rect::from_min_size(pos2(x0 + half + 6.0, y), vec2(half, 22.0));
-    if button(app, ui, r1, "Track Motion", can_track, "tracker.trackMotion") {
-        run(app, &ctx, "track.motion", src_p.clone());
-    }
-    if button(app, ui, r2, "Stabilize Motion", can_track, "tracker.stabilizeMotion") {
-        run(app, &ctx, "track.stabilize", src_p.clone());
-    }
-    y += 34.0;
+    top_buttons(app, ui, &ctx, x0, y, half, source);
+    y += 62.0;
     let Some(comp) = app.session.active_comp_arc() else {
-        p.text(pos2(x0, y + 8.0), Align2::LEFT_CENTER, "Open a composition to track motion.", Tokens::ui(12.0), t.text_faint);
+        p.text(pos2(x0, y + 8.0), Align2::LEFT_CENTER, crate::i18n::tr("Open a composition to track motion."), Tokens::ui(12.0), t.text_faint);
         return;
     };
     // A selected mask switches the panel to mask tracking.
@@ -170,7 +181,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         comp.layers.iter().enumerate().filter(|(_, l)| trackable(l)).map(|(i, l)| (l.id, format!("{}. {}", i + 1, l.name))).collect();
     let dd = Rect::from_min_size(pos2(field_x, y), vec2(field_w, 20.0));
     let name = source.and_then(|s| srcs.iter().find(|(l, _)| *l == s)).map(|(_, n)| n.clone()).unwrap_or_else(|| "None".into());
-    let did = egui::Id::new("tracker-source-dd");
+    let did = egui::Id::unique("tracker-source-dd");
     if widgets::dropdown(ui, dd, &name, &t, did).clicked() {
         widgets::open_popup(ui, did);
     }
@@ -195,7 +206,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         source.and_then(|s| comp.layer(s)).map(|l| l.trackers().map(|(g, _)| (g.uid, g.name.clone())).collect()).unwrap_or_default();
     let dd = Rect::from_min_size(pos2(field_x, y), vec2(field_w, 20.0));
     let cname = cur.and_then(|(_, u)| trackers.iter().find(|(g, _)| *g == u)).map(|(_, n)| n.clone()).unwrap_or_else(|| "None".into());
-    let did = egui::Id::new("tracker-current-dd");
+    let did = egui::Id::unique("tracker-current-dd");
     if widgets::dropdown(ui, dd, &cname, &t, did).clicked() && !trackers.is_empty() {
         widgets::open_popup(ui, did);
     }
@@ -226,7 +237,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     label(&p, pos2(x0, y + 10.0), "Track Type:", &t);
     let dd = Rect::from_min_size(pos2(field_x, y), vec2(field_w, 20.0));
     let kind = settings.as_ref().map(|s| s.kind).unwrap_or_default();
-    let did = egui::Id::new("tracker-type-dd");
+    let did = egui::Id::unique("tracker-type-dd");
     if widgets::dropdown(ui, dd, if enabled { kind.label() } else { "" }, &t, did).clicked() && enabled {
         widgets::open_popup(ui, did);
     }
@@ -246,10 +257,10 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         ("scale", "Scale", settings.as_ref().is_some_and(|s| s.scale)),
     ] {
         let cr = Rect::from_min_size(pos2(xx, y + 2.0), vec2(16.0, 16.0));
-        let resp = widgets::checkbox(ui, cr, on && transformish, &t, egui::Id::new(("tracker-cb", key)));
+        let resp = ui.add_enabled_ui(transformish, |ui| widgets::checkbox(ui, cr, on && transformish, &t, egui::Id::unique(("tracker-cb", key)))).inner;
         app.auto.add(&format!("tracker.{key}"), cr, text);
         p.text(pos2(cr.max.x + 4.0, cr.center().y), Align2::LEFT_CENTER, text, Tokens::ui(12.0), if transformish { t.text } else { t.text_faint });
-        if resp.clicked() && transformish {
+        if resp.changed() && transformish {
             run(app, &ctx, "track.setType", with(json!({ key: !on })));
         }
         xx += 84.0;
@@ -294,7 +305,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         (effectcraft_engine::tracking::Direction::FrameForward, true, true, "frameForward", "Analyze 1 frame forward"),
     ] {
         let r = Rect::from_min_size(pos2(bx, y), vec2(30.0, 22.0));
-        let resp = ui.interact(r, egui::Id::new(("tracker-analyze", id)), Sense::click()).on_hover_text(tip);
+        let resp = ui.interact(r, egui::Id::unique(("tracker-analyze", id)), Sense::click()).on_hover_text(tip);
         let stop = tracking && running_dir == Some(dir) && !frame;
         let on = enabled && (!tracking || stop);
         p.rect_filled(r, 4.0, if resp.hovered() && on { t.hover } else { t.field_bg });
@@ -366,7 +377,7 @@ fn mask_mode(app: &mut EffectcraftApp, ui: &mut egui::Ui, ctx: &egui::Context, p
     label(p, pos2(x0, y + 10.0), "Method:", &t);
     let method = app.session.state.mask_track_method;
     let dd = Rect::from_min_size(pos2(field_x, y), vec2(field_w, 20.0));
-    let did = egui::Id::new("tracker-mask-method-dd");
+    let did = egui::Id::unique("tracker-mask-method-dd");
     if widgets::dropdown(ui, dd, method.label(), &t, did).clicked() {
         widgets::open_popup(ui, did);
     }
@@ -387,7 +398,7 @@ fn mask_mode(app: &mut EffectcraftApp, ui: &mut egui::Ui, ctx: &egui::Context, p
         (effectcraft_engine::tracking::Direction::FrameForward, true, true, "frameForward", "Track selected masks 1 frame forward"),
     ] {
         let r = Rect::from_min_size(pos2(bx, y), vec2(30.0, 22.0));
-        let resp = ui.interact(r, egui::Id::new(("tracker-mask-track", id)), Sense::click()).on_hover_text(tip);
+        let resp = ui.interact(r, egui::Id::unique(("tracker-mask-track", id)), Sense::click()).on_hover_text(tip);
         let stop = running && running_dir == Some(dir) && !frame;
         let on = !running || stop;
         p.rect_filled(r, 4.0, if resp.hovered() && on { t.hover } else { t.field_bg });
@@ -476,10 +487,10 @@ fn ok_cancel(ui: &mut egui::Ui, app: &mut EffectcraftApp, t: &Tokens, prefix: &s
     let (mut ok, mut cancel) = (false, false);
     ui.add_space(14.0);
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-        let r = ui.add(egui::Button::new(egui::RichText::new("   OK   ").color(Color32::WHITE)).fill(t.accent));
+        let r = ui.add(egui::Button::new(egui::RichText::new(crate::i18n::tr("   OK   ")).color(Color32::WHITE)).fill(t.accent));
         app.auto.add(&format!("{prefix}.ok"), r.rect, "OK");
         ok = r.clicked();
-        let r = ui.button("Cancel");
+        let r = ui.button(crate::i18n::tr("Cancel"));
         app.auto.add(&format!("{prefix}.cancel"), r.rect, "Cancel");
         cancel = r.clicked();
     });
@@ -491,12 +502,12 @@ pub fn options_dialog(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens)
     let (mut ok, mut cancel) = (false, false);
     super::dialogs::modal(ctx, "Motion Tracker Options", vec2(460.0, 470.0), t, |ui| {
         ui.horizontal(|ui| {
-            ui.label("Track Name:");
+            ui.label(crate::i18n::tr("Track Name:"));
             let r = ui.text_edit_singleline(&mut d.name);
             app.auto.add("dialog.trackOptions.name", r.rect, "Track Name");
         });
         ui.add_space(8.0);
-        ui.label(egui::RichText::new("Channel").font(Tokens::medium(12.5)));
+        ui.label(egui::RichText::new(crate::i18n::tr("Channel")).font(Tokens::medium(12.5)));
         ui.horizontal(|ui| {
             for (c, l) in [(TrackChannel::Rgb, "RGB"), (TrackChannel::Luminance, "Luminance"), (TrackChannel::Saturation, "Saturation")] {
                 let r = ui.radio_value(&mut d.opts.channel, c, l);
@@ -504,21 +515,22 @@ pub fn options_dialog(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens)
             }
         });
         ui.add_space(8.0);
-        ui.label(egui::RichText::new("Process Before Match").font(Tokens::medium(12.5)));
+        ui.label(egui::RichText::new(crate::i18n::tr("Process Before Match")).font(Tokens::medium(12.5)));
         ui.horizontal(|ui| {
-            let r = ui.checkbox(&mut d.blur_on, "Blur");
+            let r = crate::widgets::labelled_checkbox(ui, &mut d.blur_on, crate::i18n::tr("Blur"));
             app.auto.add("dialog.trackOptions.blurOn", r.rect, "Blur");
-            let r = ui.add_enabled(d.blur_on, egui::DragValue::new(&mut d.opts.blur).speed(0.1).range(0.5..=50.0).suffix(" pixels"));
+            let r =
+                ui.add_enabled(d.blur_on, crate::widgets::drag_value(egui::DragValue::new(&mut d.opts.blur).speed(0.1).range(0.5..=50.0).suffix(" pixels")));
             app.auto.add("dialog.trackOptions.blur", r.rect, "Blur pixels");
-            let r = ui.checkbox(&mut d.opts.enhance, "Enhance");
+            let r = crate::widgets::labelled_checkbox(ui, &mut d.opts.enhance, crate::i18n::tr("Enhance"));
             app.auto.add("dialog.trackOptions.enhance", r.rect, "Enhance");
         });
         ui.add_space(8.0);
-        let r = ui.checkbox(&mut d.opts.subpixel, "Subpixel Positioning");
+        let r = crate::widgets::labelled_checkbox(ui, &mut d.opts.subpixel, crate::i18n::tr("Subpixel Positioning"));
         app.auto.add("dialog.trackOptions.subpixel", r.rect, "Subpixel Positioning");
-        let r = ui.checkbox(&mut d.opts.adapt_every_frame, "Adapt Feature On Every Frame");
+        let r = crate::widgets::labelled_checkbox(ui, &mut d.opts.adapt_every_frame, crate::i18n::tr("Adapt Feature On Every Frame"));
         app.auto.add("dialog.trackOptions.adaptEveryFrame", r.rect, "Adapt Feature On Every Frame");
-        let r = ui.checkbox(&mut d.opts.track_shape, "Follow Feature Rotation and Scale");
+        let r = crate::widgets::labelled_checkbox(ui, &mut d.opts.track_shape, crate::i18n::tr("Follow Feature Rotation and Scale"));
         app.auto.add("dialog.trackOptions.trackShape", r.rect, "Follow Feature Rotation and Scale");
         ui.add_space(8.0);
         ui.horizontal(|ui| {
@@ -529,7 +541,7 @@ pub fn options_dialog(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens)
                 (LowConfidence::Adapt, "Adapt Feature"),
             ];
             let cur = actions.iter().find(|(a, _)| *a == d.opts.action).map(|(_, l)| *l).unwrap_or("Adapt Feature");
-            let r = egui::ComboBox::from_id_salt("track-action")
+            let r = craft_ui::ComboBox::from_id_salt("track-action")
                 .selected_text(cur)
                 .show_ui(ui, |ui| {
                     for (a, l) in actions {
@@ -538,8 +550,8 @@ pub fn options_dialog(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens)
                 })
                 .response;
             app.auto.add("dialog.trackOptions.action", r.rect, "If Confidence is Below action");
-            ui.label("If Confidence is Below");
-            let r = ui.add(egui::DragValue::new(&mut d.opts.threshold).speed(0.5).range(0.0..=100.0).suffix(" %"));
+            ui.label(crate::i18n::tr("If Confidence is Below"));
+            let r = ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut d.opts.threshold).speed(0.5).range(0.0..=100.0).suffix(" %")));
             app.auto.add("dialog.trackOptions.threshold", r.rect, "Confidence threshold");
         });
         (ok, cancel) = ok_cancel(ui, app, t, "dialog.trackOptions");
@@ -578,15 +590,15 @@ pub fn target_dialog(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) 
     let layers: Vec<(u64, String)> =
         app.session.active_comp().map(|c| c.layers.iter().enumerate().map(|(i, l)| (l.id.0, format!("{}. {}", i + 1, l.name))).collect()).unwrap_or_default();
     super::dialogs::modal(ctx, "Motion Target", vec2(400.0, 200.0), t, |ui| {
-        ui.label("Apply Motion To:");
+        ui.label(crate::i18n::tr("Apply Motion To:"));
         ui.horizontal(|ui| {
-            ui.label("Layer:");
+            ui.label(crate::i18n::tr("Layer:"));
             let cur = d.target.and_then(|id| layers.iter().find(|(l, _)| *l == id)).map(|(_, n)| n.clone()).unwrap_or_else(|| "None".into());
-            let r = egui::ComboBox::from_id_salt("track-target")
+            let r = craft_ui::ComboBox::from_id_salt("track-target")
                 .selected_text(cur)
                 .width(240.0)
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut d.target, None, "None");
+                    ui.selectable_value(&mut d.target, None, crate::i18n::tr("None"));
                     for (id, n) in &layers {
                         ui.selectable_value(&mut d.target, Some(*id), n);
                     }
@@ -613,9 +625,9 @@ pub fn apply_dialog(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
     let (mut ok, mut cancel) = (false, false);
     super::dialogs::modal(ctx, "Motion Tracker Apply Options", vec2(380.0, 170.0), t, |ui| {
         ui.horizontal(|ui| {
-            ui.label("Apply Dimensions:");
-            let labels = ["X and Y", "X only", "Y only"];
-            let r = egui::ComboBox::from_id_salt("track-apply-dims")
+            ui.label(crate::i18n::tr("Apply Dimensions:"));
+            let labels = [crate::i18n::tr("X and Y"), crate::i18n::tr("X only"), crate::i18n::tr("Y only")];
+            let r = craft_ui::ComboBox::from_id_salt("track-apply-dims")
                 .selected_text(labels[d.dims.min(2)])
                 .show_ui(ui, |ui| {
                     for (i, l) in labels.iter().enumerate() {
@@ -748,7 +760,11 @@ pub fn draw_overlay(app: &mut EffectcraftApp, painter: &egui::Painter, map: &Vie
         let fbig = fq[0].distance(fq[2]) > 28.0;
         let sbig = sq[0].distance(sq[2]) > 28.0;
         let n = i + 1;
-        let hr = Rect::from_center_size(a, vec2(12.0, 12.0));
+        // Zoomed out the feature region can be smaller than the attach point's grab area: keep the
+        // grab to the region's inner half so the rest of it still grabs the point.
+        let fr = Rect::from_points(&fq);
+        let grab = if quad_contains(&fq, a) { 12.0f32.min(fr.width().min(fr.height()) * 0.5) } else { 12.0 };
+        let hr = Rect::from_center_size(a, vec2(grab, grab));
         hits.push(Hit { point: n, part: Part::Attach, rect: hr, quad: None });
         app.auto.add(&format!("viewer.track.{n}.attach"), hr, "Attach Point");
         for (k, q) in fq.iter().enumerate() {
@@ -767,7 +783,6 @@ pub fn draw_overlay(app: &mut EffectcraftApp, painter: &egui::Painter, map: &Vie
             hits.push(Hit { point: n, part: Part::SearchCorner(k), rect: r.expand(2.0), quad: None });
             app.auto.add(&format!("viewer.track.{n}.search.{k}"), r, "Search region corner");
         }
-        let fr = Rect::from_points(&fq);
         let sr = Rect::from_points(&sq);
         app.auto.add(&format!("viewer.track.{n}.feature"), fr, "Feature region");
         app.auto.add(&format!("viewer.track.{n}.search"), sr, "Search region");

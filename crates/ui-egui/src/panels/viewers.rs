@@ -6,6 +6,7 @@
 //! the active viewer is locked shows it in an unlocked viewer, or in a new one if every viewer is
 //! locked.
 
+use crate::i18n::tr;
 use std::sync::Arc;
 
 use effectcraft_engine::project::ItemId;
@@ -13,7 +14,7 @@ use egui::{Align2, Color32, Rect, Sense, pos2, vec2};
 use serde_json::json;
 
 use crate::EffectcraftApp;
-use crate::dock::PanelKind;
+use crate::dock::{PanelKind, WorkspaceExt as _};
 use crate::frames::{FrameImage, FrameKey};
 use crate::theme::Tokens;
 
@@ -21,13 +22,25 @@ use crate::theme::Tokens;
 pub enum PassiveTexture {
     Cpu(egui::TextureHandle),
     Gpu(egui::TextureId, Arc<effectcraft_gpu::DisplayFrame>),
+    /// A half-float frame (32 bpc) through the display pass on egui-wgpu's device.
+    Baked(Box<crate::display_gpu::Bake>),
 }
 
 impl PassiveTexture {
-    fn id(&self) -> egui::TextureId {
+    /// The texture to draw (`None`: the display pass has not made one).
+    fn id(&self) -> Option<egui::TextureId> {
         match self {
-            PassiveTexture::Cpu(h) => h.id(),
-            PassiveTexture::Gpu(id, _) => *id,
+            PassiveTexture::Cpu(h) => Some(h.id()),
+            PassiveTexture::Gpu(id, _) => Some(*id),
+            PassiveTexture::Baked(b) => b.id(),
+        }
+    }
+
+    /// Where the frame is in the texture (a frame past the texture limit is averaged down).
+    fn uv(&self) -> Rect {
+        match self {
+            PassiveTexture::Baked(b) => b.uv(),
+            _ => Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
         }
     }
 }
@@ -58,7 +71,7 @@ pub fn locked(app: &EffectcraftApp, id: u32) -> bool {
 /// Viewer `id`'s panel is docked or floating.
 fn open(app: &EffectcraftApp, id: u32) -> bool {
     let p = panel(id);
-    app.ui.dock.contains(p) || app.ui.floating.iter().any(|f| f.panels.contains(&p))
+    app.ui.dock.is_open(p)
 }
 
 /// The comp viewer `id` shows: the active comp in the active viewer, else its own.
@@ -88,7 +101,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, id: u32, rect: Rect) {
     let ctx = ui.ctx().clone();
     let p = ui.painter().with_clip_rect(rect);
     p.rect_filled(rect, 0.0, t.pasteboard);
-    let resp = ui.interact(rect, egui::Id::new(("passive-viewer", id)), Sense::click()).on_hover_text("Click to make this viewer active");
+    let resp = ui.interact(rect, egui::Id::unique(("passive-viewer", id)), Sense::click()).on_hover_text(tr("Click to make this viewer active"));
     app.auto.add(&format!("viewers.{id}"), rect, "Composition viewer (click to make it active)");
     match comp_of(app, id).and_then(|cid| Some((cid, app.session.project.comp(cid)?.clone()))) {
         Some((cid, c)) => {
@@ -100,12 +113,14 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, id: u32, rect: Rect) {
             let frame = c.frame_rate.frame_at(app.session.time_of(cid));
             app.request_frame(cid, frame, scale);
             let key = app.frame_key(cid, frame, scale);
-            if let Some(img) = app.frames.get(&key) {
-                set_texture(app, &ctx, id, key, img);
+            if let Some((key, img)) = app.frames.get_for_viewer(&key, app.passive_tex.get(&id).map(|(k, _)| k)) {
+                let dc = effectcraft_engine::viewer::DisplayColor::of(&app.session);
+                let dkey = display_hash(&super::viewer_tools::display_key(app, dc.is_some()));
+                set_texture(app, &ctx, id, key, img, dc, dkey);
             }
-            match app.passive_tex.get(&id).filter(|(k, _)| k.comp == cid.0) {
-                Some((_, tex)) => {
-                    p.image(tex.id(), r, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+            match app.passive_tex.get(&id).filter(|(k, _)| k.comp == cid.0).and_then(|(_, tex)| Some((tex.id()?, tex.uv()))) {
+                Some((tex, uv)) => {
+                    p.image(tex, r, uv, Color32::WHITE);
                 }
                 None => {
                     let bg = c.background;
@@ -116,7 +131,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, id: u32, rect: Rect) {
             p.rect_stroke(r, 0.0, egui::Stroke::new(1.0, t.separator), egui::StrokeKind::Outside);
         }
         None => {
-            p.text(rect.center(), Align2::CENTER_CENTER, "Click to show the active composition here", Tokens::ui(12.0), t.text_faint);
+            p.text(rect.center(), Align2::CENTER_CENTER, tr("Click to show the active composition here"), Tokens::ui(12.0), t.text_faint);
         }
     }
     if resp.clicked() {
@@ -125,11 +140,41 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, id: u32, rect: Rect) {
 }
 
 /// Keep the frame viewer `id` shows in its texture.
-fn set_texture(app: &mut EffectcraftApp, ctx: &egui::Context, id: u32, key: FrameKey, img: FrameImage) {
-    if app.passive_tex.get(&id).is_some_and(|(k, _)| *k == key) {
+pub(crate) fn set_texture(
+    app: &mut EffectcraftApp,
+    ctx: &egui::Context,
+    id: u32,
+    key: FrameKey,
+    img: FrameImage,
+    dc: Option<effectcraft_engine::viewer::DisplayColor>,
+    dkey: u64,
+) {
+    let dc_id = egui::Id::unique(("passive-viewer-display", id));
+    let same_display = ctx.data(|d| d.get_temp::<u64>(dc_id)) == Some(dkey);
+    if let Some((k, _)) = app.passive_tex.get_mut(&id)
+        && *k == key
+        && same_display
+    {
+        // An undo or an edit elsewhere can reuse this content at a newer revision. Keep that
+        // revision as the lower bound for subsequent intermediate edit frames.
+        k.revision = key.revision;
         return;
     }
-    let opts = super::viewer::zoom_texture_options(app.session.prefs.viewer_zoom_smooth());
+    ctx.data_mut(|d| d.insert_temp(dc_id, dkey));
+    let smooth = app.session.prefs.viewer_zoom_smooth();
+    let opts = super::viewer::zoom_texture_options(smooth);
+    let pass = |encoding| passive_pass(encoding, dc.as_ref());
+    let gpu = app.display_gpu();
+    let img = match img {
+        // Frames past the display texture limit take the CPU pass (display conversion first, then
+        // the averaging down), which the GPU bake leaves out.
+        FrameImage::CpuF16(f)
+            if app.window_wgpu.is_some() && gpu.as_ref().is_some_and(|g| !crate::display_gpu::Source::F16(f.clone()).needs_cpu_pass(g.max_side())) =>
+        {
+            FrameImage::CpuF16(f)
+        }
+        img => cpu_passive_image(app, img, dc.as_ref()),
+    };
     let tex = match (img, app.passive_tex.remove(&id)) {
         (FrameImage::Cpu(img), Some((_, PassiveTexture::Cpu(mut h))))
             if h.size() == crate::frames::fitted_size(img.size, crate::frames::max_texture_side(ctx)) =>
@@ -141,17 +186,30 @@ fn set_texture(app: &mut EffectcraftApp, ctx: &egui::Context, id: u32, key: Fram
             free(app, old.map(|(_, t)| t));
             PassiveTexture::Cpu(crate::frames::load_fitted(ctx, format!("viewer-{id}"), (*img).clone(), opts))
         }
+        (FrameImage::CpuF16(f), old) => {
+            let Some(gpu) = gpu else { return };
+            let mut bake = match old {
+                Some((_, PassiveTexture::Baked(b))) => b,
+                old => {
+                    free(app, old.map(|(_, t)| t));
+                    Box::default()
+                }
+            };
+            let Some(rs) = &app.window_wgpu else { return };
+            bake.show(rs, &gpu, &crate::display_gpu::Source::F16(f.clone()), &pass(f.encoding), smooth);
+            PassiveTexture::Baked(bake)
+        }
         (FrameImage::Gpu(f), old) => {
             let Some(rs) = &app.wgpu else { return };
             let view = f.texture.create_view(&Default::default());
-            let filter = if app.session.prefs.viewer_zoom_smooth() { eframe::wgpu::FilterMode::Linear } else { eframe::wgpu::FilterMode::Nearest };
+            let sampler = || super::viewer::zoom_sampler(smooth);
             let mut ren = rs.renderer.write();
             let tid = match old {
                 Some((_, PassiveTexture::Gpu(tid, _))) => {
-                    ren.update_egui_texture_from_wgpu_texture(&rs.device, &view, filter, tid);
+                    ren.update_egui_texture_from_wgpu_texture_with_sampler_options(&rs.device, &view, sampler(), tid);
                     tid
                 }
-                _ => ren.register_native_texture(&rs.device, &view, filter),
+                _ => ren.register_native_texture_with_sampler_options(&rs.device, &view, sampler()),
             };
             PassiveTexture::Gpu(tid, f)
         }
@@ -159,10 +217,49 @@ fn set_texture(app: &mut EffectcraftApp, ctx: &egui::Context, id: u32, key: Fram
     app.passive_tex.insert(id, (key, tex));
 }
 
+/// A passive viewer's display pass: the monitor conversion the active viewer applies (Use
+/// Display Color Management), with no channel or exposure of its own; for half-float frames
+/// also the HDR step.
+fn passive_pass(
+    encoding: effectcraft_engine::viewer::FrameEncoding,
+    dc: Option<&effectcraft_engine::viewer::DisplayColor>,
+) -> effectcraft_engine::viewer::DisplayPass {
+    effectcraft_engine::viewer::DisplayPass::new(effectcraft_engine::viewer::Channel::Rgb, false, 0.0, encoding, dc)
+}
+
+/// A frame as a passive viewer shows it without the display pass on the GPU: CPU frames through
+/// [`passive_pass`] (GPU frames unchanged).
+pub(crate) fn cpu_passive_image(app: &EffectcraftApp, img: FrameImage, dc: Option<&effectcraft_engine::viewer::DisplayColor>) -> FrameImage {
+    match img {
+        FrameImage::Cpu(img) => {
+            let pass = passive_pass(super::viewer_tools::rgba8_encoding(app), dc);
+            if pass.is_identity() {
+                return FrameImage::Cpu(img);
+            }
+            let mut px: Vec<[u8; 4]> = img.pixels.iter().map(|c| c.to_array()).collect();
+            pass.apply_rgba8(&mut px);
+            let pixels = px.into_iter().map(|a| Color32::from_rgba_premultiplied(a[0], a[1], a[2], a[3])).collect();
+            FrameImage::Cpu(Arc::new(egui::ColorImage::new(img.size, pixels)))
+        }
+        FrameImage::CpuF16(f) => FrameImage::Cpu(Arc::new(f.to_color_image(&passive_pass(f.encoding, dc)))),
+        img => img,
+    }
+}
+
+/// A hash of the display conversion's inputs (see `viewer_tools::display_key`).
+fn display_hash(key: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut h);
+    h.finish()
+}
+
 /// Give a passive viewer's texture back (GPU textures are registered with the renderer).
 fn free(app: &EffectcraftApp, tex: Option<PassiveTexture>) {
-    if let (Some(PassiveTexture::Gpu(id, _)), Some(rs)) = (tex, &app.wgpu) {
-        rs.renderer.write().free_texture(&id);
+    match (tex, &app.wgpu) {
+        (Some(PassiveTexture::Gpu(id, _)), Some(rs)) => rs.renderer.write().free_texture(&id),
+        (Some(PassiveTexture::Baked(mut b)), _) => b.free(app.window_wgpu.as_ref()),
+        _ => {}
     }
 }
 
@@ -203,7 +300,7 @@ pub fn on_open_comp(app: &mut EffectcraftApp, comp: ItemId) {
     // The comp's viewer and its Timeline tab come to the front (unless locked), reopened if they
     // were closed (as in After Effects).
     for p in [active_panel(app), PanelKind::Timeline] {
-        let closed = !app.ui.dock.contains(p) && !app.ui.floating.iter().any(|f| f.panels.contains(&p));
+        let closed = !app.ui.dock.is_open(p);
         if closed || !app.ui.locked_tabs.contains(&p.id()) {
             app.raise_panel(p);
         }
@@ -229,8 +326,8 @@ fn add_viewer(app: &mut EffectcraftApp, near: u32) -> u32 {
     let id = app.ui.viewers.keys().copied().max().unwrap_or(0).saturating_add(1).max(1);
     app.ui.viewers.insert(id, None);
     let p = panel(id);
-    let anchor = if app.ui.dock.contains(panel(near)) { panel(near) } else { PanelKind::Composition };
-    app.ui.dock.open_near(p, anchor);
+    let anchor = [panel(near), PanelKind::Composition].into_iter().find(|q| app.ui.dock.is_open(*q));
+    let _ = app.ui.dock.apply(craft_ui::docking::Action::Open { panel: p, anchor }, crate::dock::permissions);
     id
 }
 
@@ -259,5 +356,5 @@ pub fn on_close(app: &mut EffectcraftApp, p: PanelKind) {
 /// The tab label of viewer `id` ("Composition Intro").
 pub fn title(app: &EffectcraftApp, id: u32) -> Option<String> {
     let c = comp_of(app, id)?;
-    Some(format!("Composition {}", app.session.project.item(c)?.name))
+    Some(format!("{} {}", crate::i18n::command_label("window.panel", "Composition"), app.session.project.item(c)?.name))
 }

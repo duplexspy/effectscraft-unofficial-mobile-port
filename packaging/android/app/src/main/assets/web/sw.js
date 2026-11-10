@@ -3,9 +3,10 @@
 // `cargo xtask web` fills in the build's file list and version. Every file is precached into a
 // cache named after the version, served cache-first (responses keep the server's headers, so
 // the page stays cross-origin isolated: COOP/COEP), and old versions are dropped once the new
-// one activates. Anything else same-origin is fetched from the network and cached for next time.
-const VERSION = "141c7e7eb617e5ec";
-const FILES = ["./", "./audio-worklet.js", "./effectcraft_web.js", "./effectcraft_web_bg.wasm", "./favicon.svg", "./icon-256.png", "./icon-512.png", "./index.html", "./keyboard.css", "./keyboard.js", "./manifest.webmanifest", "./snippets/effectcraft-web-de687eba5d3c86a1/js/host.js", "./worker.js"];
+// one activates. Anything else same-origin is fetched from the network and cached for next time,
+// except the config file, which must stay live.
+const VERSION = "d8ff325abd4063bc";
+const FILES = ["./", "./audio-worklet.js", "./effectcraft_web.js", "./effectcraft_web_bg.wasm", "./favicon.svg", "./icon-256.png", "./icon-512.png", "./index.html", "./manifest.webmanifest", "./snippets/effectcraft-web-e65fabb8ec82e9e0/js/host.js", "./snippets/eframe-d31a8450ea12dfc1/inline0.js", "./worker.js"];
 const CACHE = `effectcraft-${VERSION}`;
 
 self.addEventListener("install", (event) => {
@@ -30,15 +31,18 @@ self.addEventListener("fetch", (event) => {
   const req = event.request;
   const url = new URL(req.url);
   if (req.method !== "GET" || url.origin !== self.location.origin) return;
+  if (url.pathname.endsWith("/effectcraft-config.json")) return;
   event.respondWith(
     (async () => {
-      const cache = await caches.open(CACHE);
-      // The page itself regardless of its query (?empty, ?demo…).
-      const key = req.mode === "navigate" ? new URL("./", self.registration.scope).href : req;
-      const hit = await cache.match(key, { ignoreSearch: req.mode === "navigate" });
-      if (hit) return hit;
+      const cache = await caches.open(CACHE).catch(() => null);
+      if (cache) {
+        // The page itself regardless of its query (?empty, ?demo…).
+        const key = req.mode === "navigate" ? new URL("./", self.registration.scope).href : req;
+        const hit = await cache.match(key, { ignoreSearch: req.mode === "navigate" }).catch(() => null);
+        if (hit) return hit;
+      }
       const res = await fetch(req);
-      if (res.ok && res.type === "basic") cache.put(req, res.clone());
+      if (cache && res.ok && res.type === "basic") void cache.put(req, res.clone()).catch(() => {});
       return res;
     })(),
   );

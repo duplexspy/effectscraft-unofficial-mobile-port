@@ -5,6 +5,13 @@
 //! and `DEQUANTIZE` of float16 weights (folded at load). Weights are re-laid out once at load for
 //! the [`nn`](crate::nn) kernels. Anything else (other operators, quantised tensors, dilation) is a
 //! load error, never a panic: models are pinned by SHA-256, so what loads once always loads.
+//!
+//! A model is also refused at load when running it would take more than a fixed budget: memory
+//! (each tensor, all tensors alive at once, one operator's working space, the weights), work
+//! (multiply-adds, values written) or kernel size. Every one is worked out from the static
+//! shapes with checked arithmetic, so a small hostile file can neither exhaust memory nor keep
+//! [`Model::run`] busy for minutes. The budgets leave wide headroom over the official
+//! MediaPipe face models.
 
 use crate::nn::{Conv, Depthwise, Linear};
 use crate::pt::half_to_f32;
@@ -111,6 +118,20 @@ mod op {
 
 /// The most values a tensor may hold.
 const MAX_TENSOR: usize = 1 << 28;
+/// The widest convolution or pooling window side.
+const MAX_KERNEL: usize = 32;
+/// The most floats one operator may use as working space (a convolution's patch matrix for one
+/// output row: `ow·kh·kw·cin`).
+const MAX_SCRATCH: u64 = 1 << 22;
+/// The most multiply-adds (convolutions) and window comparisons (pooling) in one run.
+const MAX_MACS: u64 = 1 << 33;
+/// The most values all operators together may write in one run.
+const MAX_VALUES: u64 = 1 << 30;
+/// The most floats alive at once while the model runs.
+const MAX_LIVE: u64 = 1 << 29;
+/// The most constant values decoded and laid out at load (a weight shared by several tensors or
+/// operators counts once per use).
+const MAX_CONSTS: usize = 1 << 27;
 
 /// Tensor types (`TensorType`).
 const FLOAT32: u8 = 0;
@@ -234,9 +255,12 @@ impl Model {
         let n = tensors.len();
         let mut shapes = Vec::with_capacity(n);
         let mut names = Vec::with_capacity(n);
-        // Constant data: float tensors as f32, int tensors (pads, shapes) as i32.
+        // Constant data: float tensors as f32, int tensors (pads, shapes) as i32, decoded once
+        // their total is known to fit the budget.
         let mut floats: Vec<Option<Vec<f32>>> = vec![None; n];
         let mut ints: Vec<Option<Vec<i32>>> = vec![None; n];
+        let mut data: Vec<(usize, u8, usize, &[u8])> = vec![];
+        let mut consts = 0usize;
         for (i, t) in tensors.iter().enumerate() {
             let shape: Vec<usize> = fb
                 .ints(*t, 0)?
@@ -246,8 +270,12 @@ impl Model {
             let ty = fb.byte(*t, 1, FLOAT32)?;
             let buf = fb.int(*t, 2, 0)? as u32 as usize;
             names.push(fb.string(*t, 3)?);
-            // Every size computed from shapes later stays in range.
-            let count = shape.iter().try_fold(1usize, |a, &d| a.checked_mul(d)).filter(|&c| c <= MAX_TENSOR).ok_or("a tensor is too large")?;
+            // Every size computed from shapes later stays in range, even a product of some of the
+            // dimensions (a zero dimension does not let the others grow without bound).
+            let count = shape.iter().try_fold(1usize, |a, &d| a.checked_mul(d)).ok_or("a tensor is too large")?;
+            if shape.iter().try_fold(1usize, |a, &d| a.checked_mul(d.max(1))).is_none_or(|c| c > MAX_TENSOR) {
+                return Err("a tensor is too large".into());
+            }
             if fb.field(*t, 4)?.is_some() && fb.table(*t, 4)?.is_some_and(|q| fb.vector(q, 2).is_ok_and(|v| v.1 > 0)) {
                 return Err(format!("{}: quantised tensors are not supported", names[i]));
             }
@@ -260,23 +288,33 @@ impl Model {
                     (at, len) = (o as usize, s as usize);
                 }
                 if len > 0 {
-                    let data = bytes.get(at..at.checked_add(len).ok_or("bad buffer")?).ok_or("truncated model")?;
-                    match ty {
-                        FLOAT32 if data.len() == 4 * count => {
-                            floats[i] = Some(data.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
-                        }
-                        FLOAT16 if data.len() == 2 * count => {
-                            floats[i] = Some(data.as_chunks::<2>().0.iter().map(|c| half_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect())
-                        }
-                        INT32 if data.len() == 4 * count => {
-                            ints[i] = Some(data.as_chunks::<4>().0.iter().map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
-                        }
-                        _ => return Err(format!("{}: unsupported tensor data", names[i])),
-                    }
+                    data.push((i, ty, count, bytes.get(at..at.checked_add(len).ok_or("bad buffer")?).ok_or("truncated model")?));
+                    // Several tensors may share one buffer: each is decoded on its own.
+                    consts = consts.checked_add(count).filter(|&c| c <= MAX_CONSTS).ok_or("the model's weights are too large")?;
                 }
             }
             shapes.push(shape);
         }
+        for (i, ty, count, data) in data {
+            match ty {
+                FLOAT32 if data.len() == 4 * count => {
+                    floats[i] = Some(data.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+                }
+                FLOAT16 if data.len() == 2 * count => {
+                    floats[i] = Some(data.as_chunks::<2>().0.iter().map(|c| half_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect())
+                }
+                INT32 if data.len() == 4 * count => {
+                    ints[i] = Some(data.as_chunks::<4>().0.iter().map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+                }
+                _ => return Err(format!("{}: unsupported tensor data", names[i])),
+            }
+        }
+        // Copies of constants made below (folded DEQUANTIZEs, weights laid out for the kernels).
+        let consts = std::cell::Cell::new(consts);
+        let spend = |values: usize| -> Result<()> {
+            consts.set(consts.get().checked_add(values).filter(|&c| c <= MAX_CONSTS).ok_or("the model's weights are too large")?);
+            Ok(())
+        };
         let inputs = fb.ints(g, 1)?.into_iter().map(|i| index(i, n)).collect::<Result<Vec<_>>>()?;
         let outputs = fb.ints(g, 2)?.into_iter().map(|i| index(i, n)).collect::<Result<Vec<_>>>()?;
         let mut steps = vec![];
@@ -288,9 +326,11 @@ impl Model {
             let output = index(*outs.first().ok_or("an operator has no output")?, n)?;
             // Float16 weights: fold their DEQUANTIZE.
             if code == op::DEQUANTIZE
-                && let Some(f) = ins.first().copied().flatten().and_then(|i| floats[i].clone())
+                && let Some(i) = ins.first().copied().flatten()
+                && let Some(len) = floats[i].as_ref().map(Vec::len)
             {
-                floats[output] = Some(f);
+                spend(len)?;
+                floats[output] = floats[i].clone();
                 continue;
             }
             let opts = fb.table(o, 4)?;
@@ -299,9 +339,12 @@ impl Model {
             let input = |k: usize| ins.get(k).copied().flatten().ok_or_else(|| format!("{}: missing input {k}", names[output]));
             let weights = |k: usize| -> Result<Vec<f32>> {
                 let id = input(k)?;
-                floats[id].clone().ok_or_else(|| format!("{}: input {k} is not constant", names[output]))
+                let w = floats[id].as_ref().ok_or_else(|| format!("{}: input {k} is not constant", names[output]))?;
+                spend(w.len())?;
+                Ok(w.clone())
             };
             let bias = |count: usize| -> Result<Vec<f32>> {
+                spend(count)?;
                 match ins.get(2).copied().flatten() {
                     Some(id) => floats[id].clone().filter(|b| b.len() == count).ok_or_else(|| format!("{}: bad bias", names[output])),
                     None => Ok(vec![0.0; count]),
@@ -335,6 +378,9 @@ impl Model {
                     if kh != kw || s[0] != s[1] {
                         return Err(format!("{}: only square kernels and strides are supported", names[output]));
                     }
+                    if kh > MAX_KERNEL {
+                        return Err(format!("{}: the convolution kernel is too large", names[output]));
+                    }
                     let (ey, py) = window(padding, h, kh, s[0])?;
                     let (ex, px) = window(padding, w, kw, s[1])?;
                     if (ey, ex) != (oh, ow) {
@@ -353,6 +399,7 @@ impl Model {
                         }
                         // OHWI → [(ky·ks + kx)·inp + ci] × out.
                         let kk = kh * kw * cin;
+                        spend(kk * cout)?;
                         let mut t = vec![0.0f32; kk * cout];
                         for o in 0..cout {
                             for p in 0..kk {
@@ -373,8 +420,14 @@ impl Model {
                         return Err("bad pool size".into());
                     }
                     let k = k.map(|v| v as usize);
+                    if k.iter().any(|&v| v > MAX_KERNEL) {
+                        return Err(format!("{}: the pooling window is too large", names[output]));
+                    }
                     let x = in_shape(0)?;
-                    let (&[1, h, w, _], &[1, oh, ow, _]) = (&x[..], &out_shape[..]) else { return Err("unexpected pool shapes".into()) };
+                    let (&[1, h, w, c], &[1, oh, ow, oc]) = (&x[..], &out_shape[..]) else { return Err("unexpected pool shapes".into()) };
+                    if c != oc {
+                        return Err(format!("{}: pooling changes the channels", names[output]));
+                    }
                     let (ey, py) = window(padding, h, k[0], s[0])?;
                     let (ex, px) = window(padding, w, k[1], s[1])?;
                     if (ey, ex) != (oh, ow) {
@@ -394,14 +447,34 @@ impl Model {
                         .iter()
                         .map(|c| Ok([usize::try_from(c[0]).map_err(|_| "bad pad")?, usize::try_from(c[1]).map_err(|_| "bad pad")?]))
                         .collect::<Result<Vec<_>>>()?;
+                    // The padded shape is the declared one (so it is as bounded as any tensor).
+                    let x = in_shape(0)?;
+                    let padded = x.iter().zip(&pads).map(|(d, p)| d.checked_add(p[0])?.checked_add(p[1])).collect::<Option<Vec<_>>>();
+                    if pads.len() != x.len() || padded.as_ref() != Some(&out_shape) {
+                        return Err(format!("{}: the padding disagrees with the output shape", names[output]));
+                    }
                     Op::Pad(pads)
                 }
                 op::CONCATENATION => {
                     runtime = (0..ins.len()).map(input).collect::<Result<_>>()?;
                     let rank = out_shape.len() as i32;
                     let a = opt_int(0, 0)?;
-                    let axis = if a < 0 { a + rank } else { a };
-                    Op::Concat { axis: index(axis, out_shape.len())?, act: Act::from(opt_byte(1, 0)?)? }
+                    let axis = index(if a < 0 { a.saturating_add(rank) } else { a }, out_shape.len())?;
+                    // The parts fit the output: same rank, same sizes but along `axis`, where they add up.
+                    let mut along = 0usize;
+                    for &id in &runtime {
+                        let p = &shapes[id];
+                        let fits = p.len() == out_shape.len() && p.iter().zip(&out_shape).enumerate().all(|(d, (a, b))| d == axis || a == b);
+                        along = p
+                            .get(axis)
+                            .filter(|_| fits)
+                            .and_then(|&d| along.checked_add(d))
+                            .ok_or_else(|| format!("{}: the parts disagree with the output shape", names[output]))?;
+                    }
+                    if out_shape.get(axis) != Some(&along) {
+                        return Err(format!("{}: the parts disagree with the output shape", names[output]));
+                    }
+                    Op::Concat { axis, act: Act::from(opt_byte(1, 0)?)? }
                 }
                 op::RESHAPE => Op::Reshape,
                 op::RELU => Op::Act(Act::Relu),
@@ -428,7 +501,84 @@ impl Model {
         for &o in &outputs {
             last_use[o] = usize::MAX;
         }
-        Ok(Model { shapes, names, consts: floats, steps, inputs, outputs, last_use })
+        let model = Model { shapes, names, consts: floats, steps, inputs, outputs, last_use };
+        let c = model.cost().ok_or("the model is too expensive to run")?;
+        let over = [
+            (c.kernel > MAX_KERNEL as u64, "a kernel is too large"),
+            (c.scratch > MAX_SCRATCH, "an operator's working space is too large"),
+            (c.macs > MAX_MACS, "the model needs too many multiply-adds"),
+            (c.values > MAX_VALUES, "the model does too much work"),
+            (c.live > MAX_LIVE, "the model needs too much memory"),
+        ];
+        if let Some((_, why)) = over.iter().find(|o| o.0) {
+            return Err((*why).to_string());
+        }
+        Ok(model)
+    }
+
+    /// What one run takes, from the static shapes (`None` if a count overflows).
+    fn cost(&self) -> Option<Cost> {
+        let size = |i: usize| -> Option<u64> { self.shapes.get(i)?.iter().try_fold(1u64, |a, &d| a.checked_mul(d as u64)) };
+        let mut c = Cost::default();
+        // Floats alive per tensor, as `run` keeps them: inputs are copied in, and every step's
+        // output stays until its last use (for good when nothing uses it).
+        let mut alive = vec![0u64; self.shapes.len()];
+        let mut total = 0u64;
+        for &i in &self.inputs {
+            total = total.checked_sub(*alive.get(i)?)?.checked_add(size(i)?)?;
+            *alive.get_mut(i)? = size(i)?;
+        }
+        c.live = total;
+        for (k, s) in self.steps.iter().enumerate() {
+            let &x = s.inputs.first()?;
+            let (xs, ys) = (self.shapes.get(x)?, self.shapes.get(s.output)?);
+            let dim = |sh: &[usize], d: usize| sh.get(d).copied().unwrap_or(1) as u64;
+            let (h, w, oh, ow) = (dim(xs, 1), dim(xs, 2), dim(ys, 1), dim(ys, 2));
+            let out = size(s.output)?;
+            let mut scratch = 0u64;
+            let macs = match &s.op {
+                Op::Pointwise(l, _) => h.checked_mul(w)?.checked_mul(l.inp as u64)?.checked_mul(l.out as u64)?,
+                Op::Conv(cv, ..) => {
+                    let ks = cv.ks as u64;
+                    c.kernel = c.kernel.max(ks);
+                    let kk = ks.checked_mul(ks)?.checked_mul(cv.inp as u64)?;
+                    scratch = ow.checked_mul(kk)?;
+                    oh.checked_mul(ow)?.checked_mul(cv.out as u64)?.checked_mul(kk)?
+                }
+                Op::Depthwise(d, ..) => {
+                    let ks = d.ks as u64;
+                    c.kernel = c.kernel.max(ks);
+                    oh.checked_mul(ow)?.checked_mul(d.c as u64)?.checked_mul(ks)?.checked_mul(ks)?
+                }
+                Op::MaxPool { k, .. } => {
+                    c.kernel = c.kernel.max(k[0].max(k[1]) as u64);
+                    out.checked_mul(k[0] as u64)?.checked_mul(k[1] as u64)?
+                }
+                _ => 0,
+            };
+            c.macs = c.macs.checked_add(macs)?;
+            c.values = c.values.checked_add(out)?;
+            c.scratch = c.scratch.max(scratch);
+            // The output and the scratch are allocated while the inputs (and any earlier value of
+            // the output) are still alive.
+            c.live = c.live.max(total.checked_add(out)?.checked_add(scratch)?);
+            total = total.checked_sub(*alive.get(s.output)?)?.checked_add(out)?;
+            *alive.get_mut(s.output)? = out;
+            for &i in &s.inputs {
+                if self.last_use.get(i) == Some(&k) {
+                    total = total.checked_sub(*alive.get(i)?)?;
+                    *alive.get_mut(i)? = 0;
+                }
+            }
+        }
+        // Outputs that are constants are copied out.
+        for &o in &self.outputs {
+            if *alive.get(o)? == 0 {
+                total = total.checked_add(size(o)?)?;
+            }
+        }
+        c.live = c.live.max(total);
+        Some(c)
     }
 
     /// The shape of input `k`.
@@ -530,6 +680,21 @@ impl Model {
     }
 }
 
+/// What running a model takes, worked out at load from its static shapes.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Cost {
+    /// Multiply-adds (convolutions) and window comparisons (pooling).
+    macs: u64,
+    /// Values all operators write.
+    values: u64,
+    /// The most floats alive at once.
+    live: u64,
+    /// The largest working space one operator allocates, in floats.
+    scratch: u64,
+    /// The widest window side.
+    kernel: u64,
+}
+
 /// Max pooling over `k` windows; window cells outside the input are ignored.
 fn max_pool(x: &[f32], [h, w]: [usize; 2], c: usize, [oh, ow]: [usize; 2], k: [usize; 2], s: [usize; 2], pad: [usize; 2]) -> Vec<f32> {
     let mut y = vec![f32::NEG_INFINITY; oh * ow * c];
@@ -598,65 +763,4 @@ fn concat(parts: &[(&[f32], &Vec<usize>)], axis: usize) -> Result<Vec<f32>> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn same_padding_matches_tensorflow() {
-        // TensorFlow pads the extra row after: 128 → 64 with a 3×3 stride-2 window pads 0 before.
-        assert_eq!(same(128, 3, 2), (64, 0));
-        assert_eq!(same(128, 5, 2), (64, 1));
-        assert_eq!(same(16, 3, 1), (16, 1));
-        assert_eq!(same(7, 2, 2), (4, 0));
-        assert_eq!(window(1, 4, 2, 2), Ok((2, 0)));
-        assert!(window(1, 1, 2, 2).is_err());
-    }
-
-    #[test]
-    fn asymmetric_conv_padding() {
-        // A 3×3 stride-2 "same" conv on 4×4: pads nothing before, one after.
-        let x: Vec<f32> = (0..16).map(|v| v as f32).collect();
-        let ones = vec![1.0f32; 9];
-        let c = Conv { wt: ones.clone(), b: vec![0.0], inp: 1, out: 1, ks: 3, stride: 2, pad: 0 };
-        let y = c.forward_sized(&x, 4, 4, 2, 2, [0, 0]);
-        // Top-left window rows 0–2, cols 0–2; the bottom-right one is cut by the edge.
-        assert_eq!(y, vec![45.0, 39.0, 66.0, 50.0]);
-        let d = Depthwise { w: ones, b: vec![0.0], c: 1, ks: 3, stride: 2 };
-        assert_eq!(d.forward_sized(&x, 4, 4, 2, 2, [0, 0]), y);
-    }
-
-    #[test]
-    fn pool_pad_and_concat() {
-        let x: Vec<f32> = (0..16).map(|v| v as f32).collect();
-        assert_eq!(max_pool(&x, [4, 4], 1, [2, 2], [2, 2], [2, 2], [0, 0]), vec![5.0, 7.0, 13.0, 15.0]);
-        // Same padding on 3×3 → 2×2: the last window is cut by the edge.
-        let x3: Vec<f32> = (0..9).map(|v| v as f32).collect();
-        assert_eq!(max_pool(&x3, [3, 3], 1, [2, 2], [2, 2], [2, 2], [0, 0]), vec![4.0, 5.0, 7.0, 8.0]);
-        // Channel padding (residual connections widen the channels with zeros).
-        let p = pad(&[1.0, 2.0, 3.0, 4.0], &[1, 1, 2, 2], &[[0, 0], [0, 0], [0, 0], [0, 1]]).unwrap();
-        assert_eq!(p, vec![1.0, 2.0, 0.0, 3.0, 4.0, 0.0]);
-        let p = pad(&[1.0, 2.0], &[1, 2], &[[0, 0], [1, 0]]).unwrap();
-        assert_eq!(p, vec![0.0, 1.0, 2.0]);
-        let a = [1.0, 2.0, 3.0, 4.0];
-        let b = [5.0, 6.0];
-        let (sa, sb) = (vec![1, 2, 2], vec![1, 1, 2]);
-        assert_eq!(concat(&[(&a, &sa), (&b, &sb)], 1).unwrap(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let (sa, sb) = (vec![2, 2], vec![2, 1]);
-        assert_eq!(concat(&[(&a, &sa), (&b, &sb)], 1).unwrap(), vec![1.0, 2.0, 5.0, 3.0, 4.0, 6.0]);
-    }
-
-    #[test]
-    fn damaged_files_are_errors_not_panics() {
-        assert!(Model::read(b"").is_err());
-        assert!(Model::read(&[0xff; 64]).is_err());
-        // Every prefix and a few corruptions of a hand-made buffer.
-        let mut fb = vec![12, 0, 0, 0, 0, 0, 6, 0, 8, 0, 4, 0, 6, 0, 0, 0, 0, 0, 0, 0];
-        for n in 0..fb.len() {
-            let _ = Model::read(&fb[..n]);
-        }
-        for i in 0..fb.len() {
-            fb[i] ^= 0x5a;
-            let _ = Model::read(&fb);
-        }
-    }
-}
+mod tests;

@@ -12,6 +12,7 @@
 //! `createNulls.tracePath`, `createNulls.loop`, `vrEditor.env.<output id>`, `vrEditor.pan`,
 //! `vrEditor.tilt`, `vrEditor.roll`, `vrEditor.reset`, `vrEditor.open`.
 
+use crate::i18n::tr;
 use egui::{Rect, RichText};
 use serde_json::{Value, json};
 
@@ -35,10 +36,10 @@ pub fn create_nulls(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let t = app.tokens;
     let ctx = ui.ctx().clone();
     let mut ui = area(ui, rect);
-    let loop_id = egui::Id::new("createNulls.loop");
+    let loop_id = egui::Id::unique("createNulls.loop");
     let mut looping: bool = ui.data(|d| d.get_temp(loop_id)).unwrap_or(false);
     let ready = app.session.is_enabled("paths.nullsFollowPoints") && !app.session.state.selected_layers.is_empty();
-    ui.label(RichText::new("Select a layer with a mask or shape path (or the path property), or Puppet pins.").color(t.text_dim).small());
+    ui.label(RichText::new(tr("Select a layer with a mask or shape path (or the path property), or Puppet pins.")).color(t.text_dim).small());
     ui.add_space(6.0);
     let mut acts = vec![];
     for (id, label, tip) in [
@@ -53,7 +54,7 @@ pub fn create_nulls(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             acts.push((id, if id == "paths.tracePath" { json!({"loop": looping}) } else { json!({}) }));
         }
     }
-    let r = ui.checkbox(&mut looping, "Loop (Trace Path)");
+    let r = crate::widgets::labelled_checkbox(&mut ui, &mut looping, tr("Loop (Trace Path)"));
     app.auto.add("createNulls.loop", r.rect, "Loop");
     ui.data_mut(|d| d.insert_temp(loop_id, looping));
     run(app, &ctx, acts);
@@ -66,10 +67,10 @@ pub fn vr_editor(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let mut ui = area(ui, rect);
     let envs = app.session.execute("comp.vr.environments", json!({})).ok().and_then(|v| v.as_array().cloned()).unwrap_or_default();
     if envs.is_empty() {
-        ui.label(RichText::new("No VR environments yet. Create one with Composition ▸ VR ▸ Create VR Environment…").color(t.text_faint));
+        ui.label(RichText::new(tr("No VR environments yet. Create one with Composition ▸ VR ▸ Create VR Environment…")).color(t.text_faint));
         return;
     }
-    let sel_id = egui::Id::new("vrEditor.selected");
+    let sel_id = egui::Id::unique("vrEditor.selected");
     let active = app.session.state.active_comp.map(|c| c.0);
     let mut sel: u64 = ui.data(|d| d.get_temp(sel_id)).unwrap_or(0);
     // Default: the active comp's environment, else the first.
@@ -78,7 +79,7 @@ pub fn vr_editor(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         sel = active.and_then(|c| envs.iter().find(|e| owns(e, c))).or(envs.first()).and_then(|e| e["output"].as_u64()).unwrap_or(0);
     }
     let mut acts = vec![];
-    ui.label(RichText::new("VR Environments").strong());
+    ui.label(RichText::new(tr("VR Environments")).strong());
     for e in &envs {
         let out = e["output"].as_u64().unwrap_or(0);
         let r = ui.selectable_label(out == sel, e["name"].as_str().unwrap_or(""));
@@ -90,7 +91,7 @@ pub fn vr_editor(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     ui.data_mut(|d| d.insert_temp(sel_id, sel));
     let Some(env) = envs.iter().find(|e| e["output"] == sel) else { return };
     ui.separator();
-    ui.label(RichText::new("360 View Orientation").strong());
+    ui.label(RichText::new(tr("360 View Orientation")).strong());
     let view: Vec<f64> = env["view"].as_array().map(|a| a.iter().filter_map(Value::as_f64).collect()).unwrap_or_default();
     let signed = |a: f64| if a > 180.0 { a - 360.0 } else { a };
     let (mut tilt, mut pan, mut roll) =
@@ -108,17 +109,17 @@ pub fn vr_editor(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         acts.push(("comp.vr.setView", json!({"comp": sel, "pan": pan, "tilt": tilt, "roll": roll})));
     }
     ui.horizontal(|ui| {
-        let r = ui.button("Reset");
+        let r = ui.button(tr("Reset"));
         app.auto.add("vrEditor.reset", r.rect, "Reset");
         if r.clicked() {
             acts.push(("comp.vr.setView", json!({"comp": sel, "orientation": [0.0, 0.0, 0.0]})));
         }
-        let r = ui.button("Open Output");
+        let r = ui.button(tr("Open Output"));
         app.auto.add("vrEditor.open", r.rect, "Open Output");
         if r.clicked() {
             acts.push(("comp.open", json!({"comp": sel})));
         }
     });
-    ui.label(RichText::new("All six face cameras turn together; the scene is not changed.").color(t.text_faint).small());
+    ui.label(RichText::new(tr("All six face cameras turn together; the scene is not changed.")).color(t.text_faint).small());
     run(app, &ctx, acts);
 }

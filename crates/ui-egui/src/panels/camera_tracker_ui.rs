@@ -9,10 +9,11 @@
 //!   and Camera, Create Multiple …, Delete Selected Points; Delete removes the selection;
 //! - the "Analyzing in background (step 1 of 2)" / "Solving camera" banner;
 //! - the Effect Controls block with Analyze / Cancel / Create Camera, Method Used and Average
-//!   Error.
+//!   Error, and how many frames a partial solve solved.
 //!
 //! Everything is dispatched to the `camera.*` commands.
 
+use crate::i18n::{tr, tr_args};
 use std::sync::Arc;
 
 use effectcraft_engine::Session;
@@ -27,7 +28,7 @@ use serde_json::json;
 
 use super::viewer::ViewerMap;
 use crate::theme::Tokens;
-use crate::{EffectcraftApp, widgets};
+use crate::{EffectcraftApp, a11y, widgets};
 
 /// The tracker whose points the viewer shows.
 struct Active {
@@ -214,15 +215,29 @@ pub fn viewer_hook(
         return;
     }
     // Interaction over the image.
-    let resp = ui.interact(map.area, egui::Id::new("viewer-camera-tracker"), Sense::click_and_drag());
+    // While Space (Hand tool) is held the overlay only hovers, so the viewer underneath gets the pan drag.
+    let sense = if super::space_hand(&ctx) { Sense::hover() } else { Sense::click_and_drag() };
+    let resp = ui.interact(map.area, egui::Id::unique("viewer-camera-tracker"), sense);
     app.auto.add("viewer.cameraTracker", map.area, "3D Camera Tracker points");
+    // The overlay is on top of the viewer, so a middle-button drag lands here: pan the viewer like the Hand tool.
+    if resp.dragged_by(egui::PointerButton::Middle) {
+        let pid = egui::Id::unique("viewer-camera-tracker-pan");
+        if resp.drag_started() {
+            let start_pan = app.ui.viewer.pan;
+            ui.data_mut(|d| d.insert_temp(pid, start_pan));
+        }
+        if let (Some(start_pan), Some(d)) = (ui.data(|m| m.get_temp::<[f32; 2]>(pid)), resp.total_drag_delta()) {
+            app.ui.viewer.pan = [start_pan[0] + d.x, start_pan[1] + d.y];
+        }
+        return;
+    }
     for (id, sp, r) in hits.iter().take(400) {
         app.auto.add(&format!("viewer.cameraTracker.point.{id}"), Rect::from_center_size(*sp, vec2(r * 2.0 + 4.0, r * 2.0 + 4.0)), "track point");
     }
     let hover = resp.hover_pos();
     let point_at = |p: Pos2| hits.iter().filter(|h| h.1.distance(p) <= h.2 + 3.0).min_by(|x, y| x.1.distance(p).total_cmp(&y.1.distance(p))).map(|h| h.0);
     let tri = hover.filter(|p| point_at(*p).is_none()).and_then(|p| triangle_at(&hits, p));
-    let mid = egui::Id::new("viewer-camera-tracker-marquee");
+    let mid = egui::Id::unique("viewer-camera-tracker-marquee");
     let marquee: Option<Pos2> = ui.data(|d| d.get_temp(mid));
     // Hover target / the selection's target.
     if marquee.is_none() {
@@ -269,7 +284,7 @@ pub fn viewer_hook(
         }
     }
     // Right-click: the points under the cursor (selection, else the hovered triangle).
-    let cid = egui::Id::new("viewer-camera-tracker-menu-points");
+    let cid = egui::Id::unique("viewer-camera-tracker-menu-points");
     if resp.secondary_clicked() {
         let pts: Vec<u32> = if !selected.is_empty() {
             selected.clone()
@@ -281,7 +296,7 @@ pub fn viewer_hook(
         ui.data_mut(|d| d.insert_temp(cid, pts));
     }
     let base = json!({"layer": a.layer.0, "effect": a.uid});
-    resp.context_menu(|ui| {
+    crate::widgets::context_menu(&resp, |ui| {
         let pts: Vec<u32> = ui.data(|d| d.get_temp(cid)).unwrap_or_default();
         let with = |kind: Option<&str>, multiple: bool| {
             let mut q = base.clone();
@@ -297,7 +312,7 @@ pub fn viewer_hook(
         let some = !pts.is_empty();
         let many = pts.len() > 1;
         let mut pick: Option<(&str, serde_json::Value)> = None;
-        if ui.add_enabled(some, egui::Button::new("Set Ground Plane and Origin")).clicked() {
+        if ui.add_enabled(some, egui::Button::new(tr("Set Ground Plane and Origin"))).clicked() {
             pick = Some(("camera.setGroundPlane", with(None, false)));
         }
         ui.separator();
@@ -320,7 +335,7 @@ pub fn viewer_hook(
             }
         }
         ui.separator();
-        if ui.add_enabled(some, egui::Button::new("Delete Selected Points")).clicked() {
+        if ui.add_enabled(some, egui::Button::new(tr("Delete Selected Points"))).clicked() {
             pick = Some(("camera.deletePoints", with(None, false)));
         }
         if let Some((cmd, q)) = pick {
@@ -398,28 +413,37 @@ pub fn editor(
     let b1 = Rect::from_min_size(pos2(r.min.x + 24.0, r.min.y + 4.0), vec2(84.0, 22.0));
     let b2 = Rect::from_min_size(pos2(b1.max.x + 8.0, b1.min.y), vec2(84.0, 22.0));
     let b3 = Rect::from_min_size(pos2(b2.max.x + 8.0, b1.min.y), vec2(110.0, 22.0));
-    if widgets::text_button(ui, b1, "Analyze", false, &t, egui::Id::new(("ct-analyze", g.uid))).clicked() && !busy {
+    let analyze = widgets::text_button(ui, b1, tr("Analyze"), false, &t, egui::Id::unique(("ct-analyze", g.uid)));
+    a11y::button(&analyze, tr("Analyze"), !busy);
+    if analyze.clicked() && !busy {
         actions.push(("camera.analyze".into(), me.clone()));
     }
     app.auto.add(&format!("effectControls.cameraTracker.{}.analyze", g.uid), b1, "Analyze");
     if running {
-        if widgets::text_button(ui, b2, "Cancel", false, &t, egui::Id::new(("ct-cancel", g.uid))).clicked() {
+        if widgets::text_button(ui, b2, tr("Cancel"), false, &t, egui::Id::unique(("ct-cancel", g.uid))).clicked() {
             actions.push(("camera.cancel".into(), json!({})));
         }
         app.auto.add(&format!("effectControls.cameraTracker.{}.cancel", g.uid), b2, "Cancel");
     }
     let params = effectcraft_engine::camera_track::static_params(g);
     let solve = ct::solve(&params);
+    let partial = solve.as_deref().and_then(partial_frames);
+    let dy = if partial.is_some() { PARTIAL_LINE } else { 0.0 };
     if solve.is_some() {
-        if widgets::text_button(ui, b3, "Create Camera", false, &t, egui::Id::new(("ct-camera", g.uid))).clicked() {
+        if widgets::text_button(ui, b3, tr("Create Camera"), false, &t, egui::Id::unique(("ct-camera", g.uid))).clicked() {
             actions.push(("camera.create".into(), me.clone()));
         }
         app.auto.add(&format!("effectControls.cameraTracker.{}.createCamera", g.uid), b3, "Create Camera");
+        let export = Rect::from_min_size(pos2(r.min.x + 24.0, r.min.y + 70.0 + dy), vec2(218.0, 22.0));
+        if widgets::text_button(ui, export, tr("Export Scene to Blender..."), false, &t, egui::Id::unique(("ct-blender", g.uid))).clicked() && !busy {
+            actions.push(("camera.exportBlender".into(), me.clone()));
+        }
+        app.auto.add(&format!("effectControls.cameraTracker.{}.exportBlender", g.uid), export, "Export Scene to Blender...");
     }
     let status = match app.session.camera_progress() {
         Some(pr) if running => pr.banner(),
         _ => match &solve {
-            Some(sv) => format!("Method Used: {}    Average Error: {:.2} pixels", sv.method_used.label(), sv.average_error),
+            Some(sv) => tr_args("Method Used: {}    Average Error: {} pixels", &[&(sv.method_used.label()), &format!("{:.2}", sv.average_error)]),
             None if ct::tracks(&params).is_some() && app.session.camera_pending.iter().any(|(_, l, u)| *l == layer.id && *u == g.uid) => {
                 "Waiting to solve".into()
             }
@@ -428,18 +452,41 @@ pub fn editor(
             None => "Not analyzed: click Analyze".into(),
         },
     };
-    p.text(pos2(r.min.x + 24.0, r.min.y + 38.0), Align2::LEFT_CENTER, status, Tokens::ui(11.5), t.text_dim);
+    p.text(pos2(r.min.x + 24.0, r.min.y + 38.0), Align2::LEFT_CENTER, &status, Tokens::ui(11.5), t.text_dim);
+    // The status is painted text; a read-out gives assistive technology the same words.
+    let line = |y: f32| Rect::from_min_size(pos2(r.min.x + 24.0, r.min.y + y), vec2((r.width() - 32.0).max(24.0), 16.0));
+    a11y::readout(ui, egui::Id::unique(("ct-status", g.uid)), line(30.0), &status);
+    if let Some((solved, frames)) = partial {
+        let text = tr_args("Partial solve: {} of {} frames solved", &[&solved, &frames]);
+        p.text(pos2(r.min.x + 24.0, r.min.y + 56.0), Align2::LEFT_CENTER, &text, Tokens::ui(11.5), t.warning);
+        app.auto.add(
+            &format!("effectControls.cameraTracker.{}.partialSolve", g.uid),
+            Rect::from_min_size(pos2(r.min.x + 24.0, r.min.y + 48.0), vec2(r.width() - 24.0, 16.0)),
+            &text,
+        );
+        a11y::readout(ui, egui::Id::unique(("ct-partial", g.uid)), line(48.0), &text);
+    }
     if let Some(sv) = &solve {
         let f = sv.focal();
-        p.text(
-            pos2(r.min.x + 24.0, r.min.y + 56.0),
-            Align2::LEFT_CENTER,
-            format!("{} solved points · Horizontal Angle of View {:.1}°", sv.points.len(), sv.hfov(f)),
-            Tokens::ui(11.5),
-            t.text_faint,
-        );
+        let solved = format!("{} solved points · Horizontal Angle of View {:.1}°", sv.points.len(), sv.hfov(f));
+        p.text(pos2(r.min.x + 24.0, r.min.y + 56.0 + dy), Align2::LEFT_CENTER, &solved, Tokens::ui(11.5), t.text_faint);
+        a11y::readout(ui, egui::Id::unique(("ct-solved", g.uid)), line(48.0 + dy), &solved);
     }
 }
 
-/// Height of [`editor`].
-pub const EDITOR_HEIGHT: f32 = 68.0;
+/// Height of [`editor`] without the partial-solve line.
+const EDITOR_HEIGHT: f32 = 100.0;
+const PARTIAL_LINE: f32 = 18.0;
+
+/// Height of [`editor`] for tracker `g`.
+pub fn editor_height(g: &PropGroup) -> f32 {
+    let partial = ct::solve(&effectcraft_engine::camera_track::static_params(g)).is_some_and(|sv| partial_frames(&sv).is_some());
+    if partial { EDITOR_HEIGHT + PARTIAL_LINE } else { EDITOR_HEIGHT }
+}
+
+/// `(solved, all)` frames of a solve with unsolved frames, where the solver interpolates the
+/// camera; `None` when every frame is solved.
+fn partial_frames(sv: &CameraSolve) -> Option<(usize, usize)> {
+    let solved = sv.frames.iter().filter(|c| c.solved).count();
+    (solved < sv.frames.len()).then_some((solved, sv.frames.len()))
+}

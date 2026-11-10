@@ -2,6 +2,10 @@
 //! Basic / Advanced / 3D Renderer tabs, Cancel / OK. Every control registers an automation id
 //! (`dialog.comp.<field>`).
 
+use crate::i18n::{tr, tr_args};
+use crate::icons::Icon;
+use effectcraft_engine::prefs::CompPreset;
+use effectcraft_engine::project::Resolution;
 use effectcraft_engine::time::{FrameRate, format_timecode_frames, parse_timecode};
 use egui::{Color32, vec2};
 use serde_json::json;
@@ -91,10 +95,15 @@ pub struct CompDraft {
     pub preserve_frame_rate: bool,
     pub preserve_resolution: bool,
     pub advanced_3d: bool,
+    /// The comp's Resolution (the Composition panel's popup): saved with the project but no undo
+    /// step, so OK sets it apart from `comp.new` / `comp.settings`.
+    pub resolution: Resolution,
     pub tab: Tab,
     /// Timecode text being edited (start, duration).
     pub start_tc: Option<String>,
     pub dur_tc: Option<String>,
+    /// The name being typed for Save Preset (the name row shows while `Some`).
+    pub preset_name: Option<String>,
 }
 
 impl Default for CompDraft {
@@ -117,9 +126,11 @@ impl Default for CompDraft {
             preserve_frame_rate: false,
             preserve_resolution: false,
             advanced_3d: false,
+            resolution: Resolution::Auto,
             tab: Tab::Basic,
             start_tc: None,
             dur_tc: None,
+            preset_name: None,
         }
     }
 }
@@ -170,92 +181,177 @@ fn timecode_field(ui: &mut egui::Ui, buf: &mut Option<String>, secs: &mut f64, r
     r
 }
 
-/// Draw the dialog. Returns `Some(params)` when OK is pressed, `Some(Null)` on Cancel.
-pub fn show(ui: &mut egui::Ui, d: &mut CompDraft, t: &Tokens, auto: &mut Registry) -> Option<serde_json::Value> {
-    let mut out = None;
-    ui.horizontal(|ui| {
-        ui.label("Composition Name:");
-        let r = ui.add(egui::TextEdit::singleline(&mut d.name).desired_width(300.0));
-        auto.add("dialog.comp.name", r.rect, "Composition Name");
-    });
+/// The temp-data id of the one-shot flag that makes the Save Preset name field take focus when
+/// it is next drawn.
+fn name_focus_id() -> egui::Id {
+    egui::Id::unique("comp-preset-name-focus")
+}
+
+/// Save Preset's Choose Name prompt (drawn in its own modal over the dialog while
+/// `d.preset_name` is `Some`): OK or Enter saves the draft's frame size, pixel aspect and frame
+/// rate under the name, replacing a saved preset with that name; Cancel or Escape closes it.
+pub fn choose_name(
+    ui: &mut egui::Ui,
+    d: &mut CompDraft,
+    t: &Tokens,
+    auto: &mut Registry,
+    custom: &[CompPreset],
+    cmds: &mut Vec<(&'static str, serde_json::Value)>,
+) {
+    let Some(mut name) = d.preset_name.take() else { return };
+    let mut keep = true;
+    let r = ui.add(egui::TextEdit::singleline(&mut name).desired_width(ui.available_width()));
+    auto.add("dialog.comp.presetName", r.rect, "Preset Name");
+    if ui.data_mut(|m| m.remove_temp::<bool>(name_focus_id())).unwrap_or(false) {
+        r.request_focus();
+    }
+    let trimmed = name.trim();
+    let builtin = PRESETS.iter().any(|p| p.0 == trimmed);
+    let exists = custom.iter().any(|q| q.name == trimmed);
+    let ok = !trimmed.is_empty() && !builtin && trimmed.chars().count() <= CompPreset::MAX_NAME;
+    let note = if builtin {
+        tr("A built-in preset has this name")
+    } else if exists {
+        tr("Replaces your preset with this name")
+    } else {
+        ""
+    };
+    ui.add_space(4.0);
+    ui.label(egui::RichText::new(note).color(Color32::GRAY));
     ui.add_space(8.0);
-    ui.horizontal(|ui| {
-        for (tab, label, key) in [(Tab::Basic, "Basic", "basic"), (Tab::Advanced, "Advanced", "advanced"), (Tab::Renderer, "3D Renderer", "renderer")] {
-            let r = ui.selectable_label(d.tab == tab, label);
-            auto.add(&format!("dialog.comp.tab.{key}"), r.rect, label);
-            if r.clicked() {
-                d.tab = tab;
-            }
-        }
+    let mut save = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+    let mut cancel = ui.input(|i| i.key_pressed(egui::Key::Escape));
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        let b = ui.add_enabled(ok, egui::Button::new(egui::RichText::new(tr("   OK   ")).color(Color32::WHITE)).fill(t.accent));
+        auto.add("dialog.comp.presetNameSave", b.rect, "OK");
+        save |= b.clicked();
+        let c = ui.button(tr("Cancel"));
+        auto.add("dialog.comp.presetNameCancel", c.rect, "Cancel");
+        cancel |= c.clicked();
     });
-    ui.separator();
+    if ok && save {
+        cmds.push(("comp.savePreset", json!({"name": trimmed, "width": d.width, "height": d.height, "pixelAspect": d.pixel_aspect, "frameRate": d.fps})));
+        keep = false;
+    }
+    if cancel {
+        keep = false;
+    }
+    if keep {
+        d.preset_name = Some(name);
+    }
+}
+
+/// Whether the draft's frame size, pixel aspect and frame rate are those of a preset.
+fn matches(d: &CompDraft, w: u32, h: u32, par: f64, fps: f64) -> bool {
+    w == d.width && h == d.height && (par - d.pixel_aspect).abs() < 1e-3 && (fps - d.fps).abs() < 1e-3
+}
+
+/// The controls of one tab.
+fn tab_body(
+    ui: &mut egui::Ui,
+    tab: Tab,
+    d: &mut CompDraft,
+    t: &Tokens,
+    auto: &mut Registry,
+    custom: &[CompPreset],
+    cmds: &mut Vec<(&'static str, serde_json::Value)>,
+) {
     let rate = FrameRate::from_f64(d.fps);
-    match d.tab {
+    match tab {
         Tab::Basic => {
             egui::Grid::new("comp-basic").num_columns(2).spacing([12.0, 9.0]).show(ui, |ui| {
-                ui.label("Preset:");
-                let current = PRESETS
-                    .iter()
-                    .find(|(_, w, h, par, f)| *w == d.width && *h == d.height && (par - d.pixel_aspect).abs() < 1e-3 && (f - d.fps).abs() < 1e-3)
-                    .map(|p| p.0)
+                ui.label(tr("Preset:"));
+                // The user's own presets win over a built-in one with the same values.
+                let own = custom.iter().find(|q| matches(d, q.width, q.height, q.pixel_aspect, q.frame_rate));
+                let current = own
+                    .map(|q| q.name.as_str())
+                    .or_else(|| PRESETS.iter().find(|(_, w, h, par, f)| matches(d, *w, *h, *par, *f)).map(|p| p.0))
                     .unwrap_or("Custom");
-                let r = egui::ComboBox::from_id_salt("comp-preset").width(300.0).selected_text(current).show_ui(ui, |ui| {
-                    for (name, w, h, par, f) in PRESETS {
-                        if ui.selectable_label(*name == current, *name).clicked() {
-                            (d.width, d.height, d.pixel_aspect, d.fps) = (*w, *h, *par, *f);
+                ui.horizontal(|ui| {
+                    let r = craft_ui::ComboBox::from_id_salt("comp-preset").width(300.0).selected_text(current).show_ui(ui, |ui| {
+                        // Your own presets first, then the built-in ones.
+                        for q in custom {
+                            if ui.selectable_label(q.name == current, &q.name).clicked() {
+                                (d.width, d.height, d.pixel_aspect, d.fps) = (q.width, q.height, q.pixel_aspect, q.frame_rate);
+                            }
+                        }
+                        if !custom.is_empty() {
+                            ui.separator();
+                        }
+                        for (name, w, h, par, f) in PRESETS {
+                            if ui.selectable_label(*name == current, *name).clicked() {
+                                (d.width, d.height, d.pixel_aspect, d.fps) = (*w, *h, *par, *f);
+                            }
+                        }
+                    });
+                    auto.add("dialog.comp.preset", r.response.rect, "Preset");
+                    let (save_r, _) = ui.allocate_exact_size(vec2(20.0, 20.0), egui::Sense::hover());
+                    let save = crate::widgets::icon_button(ui, save_r, Icon::Plus, d.preset_name.is_some(), t, egui::Id::unique("comp-preset-save"))
+                        .on_hover_text(tr("Save Preset…"));
+                    auto.add("dialog.comp.presetSave", save_r, "Save Preset");
+                    if save.clicked() {
+                        d.preset_name = Some(own.map(|q| q.name.clone()).unwrap_or_default());
+                        ui.data_mut(|m| m.insert_temp(name_focus_id(), true));
+                    }
+                    if let Some(q) = own {
+                        let (del_r, _) = ui.allocate_exact_size(vec2(20.0, 20.0), egui::Sense::hover());
+                        let del = crate::widgets::icon_button(ui, del_r, Icon::Trash, false, t, egui::Id::unique("comp-preset-delete"))
+                            .on_hover_text(tr("Delete Preset"));
+                        auto.add("dialog.comp.presetDelete", del_r, "Delete Preset");
+                        if del.clicked() {
+                            cmds.push(("comp.deletePreset", json!({"name": q.name})));
                         }
                     }
                 });
-                auto.add("dialog.comp.preset", r.response.rect, "Preset");
                 ui.end_row();
-                ui.label("Width:");
+                ui.label(tr("Width:"));
                 ui.horizontal(|ui| {
                     let (ow, oh) = (d.width, d.height);
-                    let r = ui.add(egui::DragValue::new(&mut d.width).range(4..=30000).suffix(" px"));
+                    let r = ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut d.width).range(4..=30000).suffix(" px")));
                     auto.add("dialog.comp.width", r.rect, "Width");
-                    let lbl = format!("Lock Aspect Ratio to {}", aspect_label(ow as f64, oh as f64));
-                    let r = ui.checkbox(&mut d.lock_aspect, lbl);
+                    let lbl = tr_args("Lock Aspect Ratio to {}", &[&(aspect_label(ow as f64, oh as f64))]);
+                    let r = crate::widgets::labelled_checkbox(ui, &mut d.lock_aspect, lbl);
                     auto.add("dialog.comp.lockAspect", r.rect, "Lock Aspect Ratio");
                     if d.lock_aspect && ow != d.width && ow > 0 {
                         d.height = ((d.width as f64) * oh as f64 / ow as f64).round().max(4.0) as u32;
                     }
                 });
                 ui.end_row();
-                ui.label("Height:");
+                ui.label(tr("Height:"));
                 let (ow, oh) = (d.width, d.height);
-                let r = ui.add(egui::DragValue::new(&mut d.height).range(4..=30000).suffix(" px"));
+                let r = ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut d.height).range(4..=30000).suffix(" px")));
                 auto.add("dialog.comp.height", r.rect, "Height");
                 if d.lock_aspect && oh != d.height && oh > 0 {
                     d.width = ((d.height as f64) * ow as f64 / oh as f64).round().max(4.0) as u32;
                 }
                 ui.end_row();
-                ui.label("Pixel Aspect Ratio:");
+                ui.label(tr("Pixel Aspect Ratio:"));
                 ui.horizontal(|ui| {
                     let cur = PIXEL_ASPECTS
                         .iter()
                         .find(|(_, v)| (v - d.pixel_aspect).abs() < 1e-3)
-                        .map(|p| p.0.to_string())
+                        .map(|p| tr(p.0).to_string())
                         .unwrap_or_else(|| format!("{:.2}", d.pixel_aspect));
-                    let r = egui::ComboBox::from_id_salt("comp-par").width(220.0).selected_text(cur).show_ui(ui, |ui| {
+                    let r = craft_ui::ComboBox::from_id_salt("comp-par").width(220.0).selected_text(cur).show_ui(ui, |ui| {
                         for (name, v) in PIXEL_ASPECTS {
-                            if ui.selectable_label((v - d.pixel_aspect).abs() < 1e-3, *name).clicked() {
+                            if ui.selectable_label((v - d.pixel_aspect).abs() < 1e-3, tr(name)).clicked() {
                                 d.pixel_aspect = *v;
                             }
                         }
                     });
                     auto.add("dialog.comp.pixelAspect", r.response.rect, "Pixel Aspect Ratio");
                     ui.label(
-                        egui::RichText::new(format!("Frame Aspect Ratio: {}", aspect_label(d.width as f64 * d.pixel_aspect, d.height as f64)))
+                        egui::RichText::new(tr_args("Frame Aspect Ratio: {}", &[&(aspect_label(d.width as f64 * d.pixel_aspect, d.height as f64))]))
                             .color(Color32::GRAY),
                     );
                 });
                 ui.end_row();
-                ui.label("Frame Rate:");
+                ui.label(tr("Frame Rate:"));
                 ui.horizontal(|ui| {
                     // Any rate can be typed; the list holds the common ones.
-                    let r = ui.add(egui::DragValue::new(&mut d.fps).range(1.0..=999.0).speed(0.01).max_decimals(3));
+                    let r = ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut d.fps).range(1.0..=999.0).speed(0.01).max_decimals(3)));
                     auto.add("dialog.comp.frameRate", r.rect, "Frame Rate");
-                    let r = egui::ComboBox::from_id_salt("comp-fps").width(18.0).selected_text("").show_ui(ui, |ui| {
+                    let r = craft_ui::ComboBox::from_id_salt("comp-fps").width(18.0).selected_text("").show_ui(ui, |ui| {
                         for f in FRAME_RATES {
                             if ui.selectable_label((d.fps - f).abs() < 1e-3, format!("{f}")).clicked() {
                                 d.fps = *f;
@@ -263,36 +359,57 @@ pub fn show(ui: &mut egui::Ui, d: &mut CompDraft, t: &Tokens, auto: &mut Registr
                         }
                     });
                     auto.add("dialog.comp.frameRates", r.response.rect, "Frame Rate presets");
-                    ui.label("frames per second");
+                    ui.label(tr("frames per second"));
                     if rate.supports_drop_frame() {
-                        ui.label(egui::RichText::new("Drop Frame").color(Color32::GRAY));
+                        ui.label(egui::RichText::new(tr("Drop Frame")).color(Color32::GRAY));
                     }
                 });
                 ui.end_row();
-                ui.label("");
-                let mb = d.width as f64 * d.height as f64 * 4.0 / (1024.0 * 1024.0);
-                ui.label(egui::RichText::new(format!("{} x {}, {mb:.1}MB per 8bpc frame", d.width, d.height)).color(Color32::GRAY));
+                // As in After Effects, the Resolution menu (the Composition panel's popup) with
+                // the frame it renders beside it.
+                ui.label(tr("Resolution:"));
+                ui.horizontal(|ui| {
+                    let r = craft_ui::ComboBox::from_id_salt("comp-resolution").width(90.0).selected_text(tr(d.resolution.label())).show_ui(ui, |ui| {
+                        for res in Resolution::ALL {
+                            ui.selectable_value(&mut d.resolution, res, tr(res.label()));
+                        }
+                        let custom = matches!(d.resolution, Resolution::Custom(_));
+                        if ui.selectable_label(custom, tr("Custom")).clicked() && !custom {
+                            d.resolution = Resolution::Custom(5);
+                        }
+                    });
+                    auto.add("dialog.comp.resolution", r.response.rect, "Resolution");
+                    if let Resolution::Custom(n) = d.resolution {
+                        let mut n = n;
+                        let r = ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut n).range(2..=40)));
+                        auto.add("dialog.comp.resolutionFactor", r.rect, "Custom Resolution");
+                        d.resolution = Resolution::Custom(n);
+                    }
+                    let (w, h) = frame_at(d.width, d.height, d.resolution);
+                    let mb = w as f64 * h as f64 * 4.0 / (1024.0 * 1024.0);
+                    ui.label(egui::RichText::new(tr_args("{} x {}, {}MB per 8bpc frame", &[&w, &h, &format!("{mb:.1}")])).color(Color32::GRAY));
+                });
                 ui.end_row();
-                ui.label("Start Timecode:");
+                ui.label(tr("Start Timecode:"));
                 let r = ui.horizontal(|ui| timecode_field(ui, &mut d.start_tc, &mut d.start, rate, i64::MIN / 4)).inner;
                 auto.add("dialog.comp.startTimecode", r.rect, "Start Timecode");
                 ui.end_row();
-                ui.label("Duration:");
+                ui.label(tr("Duration:"));
                 let r = ui.horizontal(|ui| timecode_field(ui, &mut d.dur_tc, &mut d.duration, rate, 1)).inner;
                 auto.add("dialog.comp.duration", r.rect, "Duration");
                 ui.end_row();
-                ui.label("Background Color:");
+                ui.label(tr("Background Color:"));
                 ui.horizontal(|ui| {
                     let r = crate::widgets::srgb_color_button(ui, &mut d.bg);
                     auto.add("dialog.comp.background", r.rect, "Background Color");
-                    ui.label(color_name(d.bg));
+                    ui.label(tr(color_name(d.bg)));
                 });
                 ui.end_row();
             });
         }
         Tab::Advanced => {
             egui::Grid::new("comp-adv").num_columns(2).spacing([12.0, 9.0]).show(ui, |ui| {
-                ui.label("Anchor:");
+                ui.label(tr("Anchor:"));
                 egui::Grid::new("comp-anchor").spacing([2.0, 2.0]).show(ui, |ui| {
                     for i in 0..9u8 {
                         let on = d.anchor == i;
@@ -309,57 +426,140 @@ pub fn show(ui: &mut egui::Ui, d: &mut CompDraft, t: &Tokens, auto: &mut Registr
                 });
                 ui.end_row();
                 ui.label("");
-                let r = ui.checkbox(&mut d.preserve_frame_rate, "Preserve frame rate when nested or in render queue");
+                let r = crate::widgets::labelled_checkbox(ui, &mut d.preserve_frame_rate, tr("Preserve frame rate when nested or in render queue"));
                 auto.add("dialog.comp.preserveFrameRate", r.rect, "Preserve frame rate when nested or in render queue");
                 ui.end_row();
                 ui.label("");
-                let r = ui.checkbox(&mut d.preserve_resolution, "Preserve resolution when nested");
+                let r = crate::widgets::labelled_checkbox(ui, &mut d.preserve_resolution, tr("Preserve resolution when nested"));
                 auto.add("dialog.comp.preserveResolution", r.rect, "Preserve resolution when nested");
                 ui.end_row();
-                ui.label(egui::RichText::new("Motion Blur").strong());
+                ui.label(egui::RichText::new(tr("Motion Blur")).strong());
                 ui.end_row();
-                ui.label("Shutter Angle:");
-                let r = ui.add(egui::DragValue::new(&mut d.shutter_angle).range(0.0..=720.0).suffix("°"));
+                ui.label(tr("Shutter Angle:"));
+                let r = ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut d.shutter_angle).range(0.0..=720.0).suffix("°")));
                 auto.add("dialog.comp.shutterAngle", r.rect, "Shutter Angle");
                 ui.end_row();
-                ui.label("Shutter Phase:");
-                let r = ui.add(egui::DragValue::new(&mut d.shutter_phase).range(-360.0..=360.0).suffix("°"));
+                ui.label(tr("Shutter Phase:"));
+                let r = ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut d.shutter_phase).range(-360.0..=360.0).suffix("°")));
                 auto.add("dialog.comp.shutterPhase", r.rect, "Shutter Phase");
                 ui.end_row();
-                ui.label("Samples Per Frame:");
-                let r = ui.add(egui::DragValue::new(&mut d.samples).range(2..=64));
+                ui.label(tr("Samples Per Frame:"));
+                let r = ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut d.samples).range(2..=64)));
                 auto.add("dialog.comp.samples", r.rect, "Samples Per Frame");
                 ui.end_row();
-                ui.label("Adaptive Sample Limit:");
-                let r = ui.add(egui::DragValue::new(&mut d.adaptive_limit).range(16..=256));
+                ui.label(tr("Adaptive Sample Limit:"));
+                let r = ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut d.adaptive_limit).range(16..=256)));
                 auto.add("dialog.comp.adaptiveLimit", r.rect, "Adaptive Sample Limit");
                 ui.end_row();
             });
         }
         Tab::Renderer => {
             ui.horizontal(|ui| {
-                ui.label("Renderer:");
-                let r =
-                    egui::ComboBox::from_id_salt("comp-renderer").selected_text(if d.advanced_3d { "Advanced 3D" } else { "Classic 3D" }).show_ui(ui, |ui| {
-                        ui.selectable_value(&mut d.advanced_3d, false, "Classic 3D");
-                        ui.selectable_value(&mut d.advanced_3d, true, "Advanced 3D");
-                    });
+                ui.label(tr("Renderer:"));
+                let r = craft_ui::ComboBox::from_id_salt("comp-renderer").selected_text(tr(if d.advanced_3d { "Advanced 3D" } else { "Classic 3D" })).show_ui(
+                    ui,
+                    |ui| {
+                        ui.selectable_value(&mut d.advanced_3d, false, tr("Classic 3D"));
+                        ui.selectable_value(&mut d.advanced_3d, true, tr("Advanced 3D"));
+                    },
+                );
                 auto.add("dialog.comp.renderer", r.response.rect, "Renderer");
             });
         }
     }
+}
+
+/// The width and height `tab` would take at `top`, from laying it out unseen: they follow the
+/// font, the language and the scale. Nothing it registers or changes is kept.
+fn tab_size(ui: &mut egui::Ui, tab: Tab, d: &CompDraft, t: &Tokens, custom: &[CompPreset], top: f32) -> egui::Vec2 {
+    let rect = egui::Rect::from_min_size(egui::pos2(ui.max_rect().left(), top), vec2(ui.max_rect().width(), 0.0));
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect).id_salt("comp-tab-measure").invisible());
+    tab_body(&mut child, tab, &mut d.clone(), t, &mut Registry::default(), custom, &mut Vec::new());
+    vec2(child.min_rect().width(), child.cursor().top() - top)
+}
+
+/// Where the width of the dialog's content, measured when it was last shown, is kept.
+fn content_width_id() -> egui::Id {
+    egui::Id::unique("comp-settings-content-width")
+}
+
+/// The dialog's width: 600 points, or more when the widest row on any of its tabs (as last shown),
+/// a scroll bar and the modal's two 18-point margins need it. A translation longer than the English (French,
+/// #2841) widens the dialog rather than hiding OK past its right edge.
+pub fn dialog_width(ctx: &egui::Context) -> f32 {
+    let content = ctx.data(|d| d.get_temp::<f32>(content_width_id())).unwrap_or(0.0);
+    (content + 36.0).max(600.0)
+}
+
+/// Draw the dialog. Returns `Some(params)` when OK is pressed, `Some(Null)` on Cancel. `custom`
+/// are the presets the user saved; saving or deleting one pushes its engine command to `cmds`.
+pub fn show(
+    ui: &mut egui::Ui,
+    d: &mut CompDraft,
+    t: &Tokens,
+    auto: &mut Registry,
+    custom: &[CompPreset],
+    cmds: &mut Vec<(&'static str, serde_json::Value)>,
+    preview: Option<&mut bool>,
+) -> Option<serde_json::Value> {
+    let mut out = None;
+    // The dialog's visible area, which Cancel and OK stay inside: the scroll area's viewport,
+    // which stays put when the content scrolls.
+    auto.add("dialog.comp.view", ui.clip_rect(), "Composition Settings");
+    let name_row = ui.horizontal(|ui| {
+        ui.label(tr("Composition Name:"));
+        let r = ui.add(egui::TextEdit::singleline(&mut d.name).desired_width(300.0));
+        crate::widgets::focus_on_open(ui.ctx(), &r, &d.name);
+        auto.add("dialog.comp.name", r.rect, "Composition Name");
+    });
+    ui.add_space(8.0);
+    let tab_row = ui.horizontal(|ui| {
+        for (tab, label, key) in [(Tab::Basic, "Basic", "basic"), (Tab::Advanced, "Advanced", "advanced"), (Tab::Renderer, "3D Renderer", "renderer")] {
+            let r = ui.selectable_label(d.tab == tab, tr(label));
+            auto.add(&format!("dialog.comp.tab.{key}"), r.rect, label);
+            if r.clicked() {
+                d.tab = tab;
+            }
+        }
+    });
+    ui.separator();
+    // Every tab takes the height of the tallest one, so Cancel and OK stay put between tabs.
+    let body_top = ui.cursor().top();
+    tab_body(ui, d.tab, d, t, auto, custom, cmds);
+    let shown = ui.cursor().top() - body_top;
+    let sizes: Vec<egui::Vec2> = [Tab::Basic, Tab::Advanced, Tab::Renderer].into_iter().map(|tab| tab_size(ui, tab, d, t, custom, body_top)).collect();
+    let tallest = sizes.iter().fold(shown, |h, s| h.max(s.y));
+    ui.add_space((tallest - shown).max(0.0));
+    // Every tab takes the width of the widest one too, so the dialog doesn't change size with them.
+    let widest = sizes.iter().fold(name_row.response.rect.width().max(tab_row.response.rect.width()), |w, s| w.max(s.x));
+    // Room for a vertical scroll bar too: without it, a bar shown while the dialog settles narrows
+    // the content into a horizontal bar, which takes the height back from it, and the two bars
+    // trade places every frame.
+    let needed = widest + ui.spacing().scroll.allocated_width();
+    let ctx = ui.ctx().clone();
+    let before = dialog_width(&ctx);
+    ctx.data_mut(|m| m.insert_temp(content_width_id(), needed.ceil()));
+    if dialog_width(&ctx) != before {
+        // This pass was laid out at the old width: lay it out again at the new one instead of
+        // showing it, and paint again in case egui declines the extra pass.
+        ctx.request_discard("Composition Settings width");
+        ctx.request_repaint();
+    }
     ui.add_space(14.0);
     ui.horizontal(|ui| {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let r = ui.add(egui::Button::new(egui::RichText::new("   OK   ").color(Color32::WHITE)).fill(t.accent));
+            let r = ui.add(egui::Button::new(egui::RichText::new(tr("   OK   ")).color(Color32::WHITE)).fill(t.accent));
             auto.add("dialog.comp.ok", r.rect, "OK");
             if r.clicked() {
                 out = Some(params(d));
             }
-            let r = ui.button("Cancel");
+            let r = ui.button(tr("Cancel"));
             auto.add("dialog.comp.cancel", r.rect, "Cancel");
             if r.clicked() {
                 out = Some(serde_json::Value::Null);
+            }
+            if let Some(on) = preview {
+                super::live_preview::checkbox(ui, auto, on, "dialog.comp.preview");
             }
         });
     });
@@ -377,9 +577,25 @@ pub fn params(d: &CompDraft) -> serde_json::Value {
     })
 }
 
+/// The frame size the comp renders at `res` (Auto follows the magnification, so the dialog shows
+/// the full frame for it).
+pub fn frame_at(w: u32, h: u32, res: Resolution) -> (u32, u32) {
+    effectcraft_render::frame_size(w, h, 1.0 / f64::from(res.factor().unwrap_or(1).max(1)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_size_follows_the_resolution() {
+        // The renderer's size, which rounds: 1081 / 3 = 360.33 and 1920 / 7 = 274.3.
+        assert_eq!(frame_at(1920, 1081, Resolution::Third), (640, 360));
+        assert_eq!(frame_at(1920, 1080, Resolution::Custom(7)), (274, 154));
+        assert_eq!(frame_at(1920, 1081, Resolution::Half), (960, 541));
+        assert_eq!(frame_at(1920, 1080, Resolution::Full), (1920, 1080));
+        assert_eq!(frame_at(1920, 1080, Resolution::Auto), (1920, 1080));
+    }
 
     #[test]
     fn aspect_labels_match_ae() {

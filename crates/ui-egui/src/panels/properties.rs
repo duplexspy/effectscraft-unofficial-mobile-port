@@ -15,6 +15,7 @@ use egui::{Align2, Color32, Rect, Sense, Stroke, pos2, vec2};
 use serde_json::json;
 
 use crate::dock::PanelKind;
+use crate::i18n::tr;
 use crate::icons::{self, Icon};
 use crate::theme::Tokens;
 use crate::{EffectcraftApp, widgets};
@@ -50,6 +51,12 @@ fn decimals(v: f64) -> usize {
     if (v - v.round()).abs() < 1e-6 { 0 } else { 1 }
 }
 
+/// The Properties panel for the first selected layer: "N Selected Objects" when several are
+/// selected, the Layer Transform section (with Reset) and, for a text layer, the text, paragraph
+/// and Text Animation sections that edit the range being edited in the viewer. Rows are evaluated
+/// against a snapshot of the project; every row edit is queued and run through
+/// [`crate::menus::invoke`] at the end (range-scoped for `layer.setText`), with failures reported
+/// in `app.ui.status`. Without a selected layer it shows a hint.
 pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let t = app.tokens;
     let p = ui.painter().with_clip_rect(rect);
@@ -57,26 +64,49 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let comp = app.session.active_comp_arc();
     let layer = comp.as_ref().and_then(|c| app.session.state.selected_layers.first().and_then(|id| c.layer(*id)).cloned());
     let (Some(comp), Some(cid), Some(layer)) = (comp, app.session.active_comp_id(), layer) else {
-        p.text(rect.center(), Align2::CENTER_CENTER, "Select a layer to see its properties", Tokens::ui(12.0), t.text_faint);
+        p.text(rect.center(), Align2::CENTER_CENTER, crate::i18n::tr("Select a layer to see its properties"), Tokens::ui(12.0), t.text_faint);
         return;
     };
     let project = app.session.project.clone();
     let expr = app.session.expr.clone();
     let now = app.session.time();
-    let ectx = EvalCtx { project: &project, comp_id: cid, comp: &comp, time: now, expr: expr.as_deref(), footage: None };
+    let ectx = EvalCtx {
+        project: &project,
+        comp_id: cid,
+        comp: &comp,
+        time: now,
+        expr: expr.as_deref(),
+        footage: None,
+        property_overrides: &[],
+        media_overrides: &[],
+        reads: None,
+    };
+    let scroll = widgets::PanelScroll::begin(ui, egui::Id::unique("props-scroll"), rect);
+    let rect = scroll.content;
+    let p = p.with_clip_rect(rect);
     let x0 = rect.min.x + PAD;
     let w = rect.width() - 2.0 * PAD;
-    let scroll = widgets::PanelScroll::begin(ui, egui::Id::new("props-scroll"), rect);
     let top = rect.min.y + 8.0 - scroll.offset;
     let mut y = top;
     let mut actions: Actions = vec![];
 
+    // Several layers selected: "(3) Selected Objects", as in After Effects. The rows show the
+    // first layer; the stopwatch, keyframe button and value edits apply to all of them (#355).
+    let selected = app.session.state.selected_layers.iter().filter(|id| comp.layer(**id).is_some()).count();
+    if selected > 1 {
+        let n = selected.to_string();
+        let label = crate::i18n::tr_args("({}) Selected Objects", &[&n]);
+        p.text(pos2(x0, y + ROW_H / 2.0), Align2::LEFT_CENTER, &label, Tokens::semibold(12.0), t.text);
+        app.auto.add("properties.selectedObjects", Rect::from_min_size(pos2(x0, y), vec2(w, ROW_H)), &label);
+        y += ROW_H + 4.0;
+    }
+
     // ---------------------------------------------------------------- Layer Transform
     if let Some(tr) = layer.transform().cloned() {
-        section_header(app, ui, &p, x0, w, y, "Layer Transform", "properties.transform");
+        section_header(app, &p, x0, w, y, "Layer Transform", "properties.transform");
         let rr = Rect::from_min_size(pos2(x0 + w - 40.0, y), vec2(40.0, ROW_H));
-        let resp = ui.interact(rr, egui::Id::new("props-reset"), Sense::click());
-        p.text(rr.right_center(), Align2::RIGHT_CENTER, "Reset", Tokens::ui(12.0), if resp.hovered() { t.accent_hover } else { t.accent });
+        let resp = ui.interact(rr, egui::Id::unique("props-reset"), Sense::click());
+        p.text(rr.right_center(), Align2::RIGHT_CENTER, crate::i18n::tr("Reset"), Tokens::ui(12.0), if resp.hovered() { t.accent_hover } else { t.accent });
         app.auto.add("properties.transform.reset", rr, "Reset Transform");
         if resp.clicked() {
             for pr in tr.props() {
@@ -106,21 +136,24 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         divider(&p, x0, w, y - 4.0, &t);
         y = paragraph_section(app, ui, &p, &layer, &doc, x0, w, y + 4.0, &mut actions);
         divider(&p, x0, w, y - 4.0, &t);
-        section_header(app, ui, &p, x0, w, y + 4.0, "Text Animation", "properties.textAnimation");
+        section_header(app, &p, x0, w, y + 4.0, "Text Animation", "properties.textAnimation");
         y += ROW_H + 10.0;
-        let br = Rect::from_min_size(pos2(x0, y), vec2(116.0, 24.0));
-        let resp = ui.interact(br, egui::Id::new("props-add-animator"), Sense::click());
+        // Both buttons grow with their (translated) labels; English keeps its 116 / 84 px.
+        let text_w = |s: &str| p.layout_no_wrap(s.to_string(), Tokens::ui(12.0), t.text).size().x;
+        let br = Rect::from_min_size(pos2(x0, y), vec2(116f32.max(text_w(crate::i18n::tr("Add Animator")) + 36.0), 24.0));
+        let resp = ui.interact(br, egui::Id::unique("props-add-animator"), Sense::click());
         p.rect_stroke(br, 4.0, Stroke::new(1.0, if resp.hovered() { t.text_dim } else { t.field_border }), egui::StrokeKind::Inside);
         icons::paint(&p, Rect::from_center_size(pos2(br.min.x + 14.0, br.center().y), vec2(10.0, 10.0)), Icon::Plus, t.text);
-        p.text(pos2(br.min.x + 26.0, br.center().y), Align2::LEFT_CENTER, "Add Animator", Tokens::ui(12.0), t.text);
+        p.text(pos2(br.min.x + 26.0, br.center().y), Align2::LEFT_CENTER, crate::i18n::tr("Add Animator"), Tokens::ui(12.0), t.text);
         app.auto.add("properties.addAnimator", br, "Add Animator");
-        let pop = egui::Id::new("props-add-animator-pop");
+        let pop = egui::Id::unique("props-add-animator-pop");
         if resp.clicked() {
             widgets::open_popup(ui, pop);
         }
         let per_char = layer.props.prop("text/perChar3d").is_some_and(|q| q.value.as_bool());
         let entries = animator_entries(per_char);
-        let labels: Vec<String> = entries.iter().map(|(l, _)| l.clone()).collect();
+        // The entries are the English source strings; the menu draws them translated.
+        let labels: Vec<String> = entries.iter().map(|(l, _)| tr(l).to_string()).collect();
         if let Some(i) = widgets::popup_menu(ui, pop, br.left_bottom(), &labels, None) {
             match entries[i].1 {
                 "" => {}
@@ -129,12 +162,12 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             }
         }
         // Our own presets (original work, see presets/text_animators.json).
-        let pr = Rect::from_min_size(pos2(br.max.x + 8.0, y), vec2(84.0, 24.0));
-        let presp = ui.interact(pr, egui::Id::new("props-text-presets"), Sense::click());
+        let pr = Rect::from_min_size(pos2(br.max.x + 8.0, y), vec2(84f32.max(text_w(crate::i18n::tr("Presets")) + 16.0), 24.0));
+        let presp = ui.interact(pr, egui::Id::unique("props-text-presets"), Sense::click());
         p.rect_stroke(pr, 4.0, Stroke::new(1.0, if presp.hovered() { t.text_dim } else { t.field_border }), egui::StrokeKind::Inside);
-        p.text(pr.center(), Align2::CENTER_CENTER, "Presets", Tokens::ui(12.0), t.text);
+        p.text(pr.center(), Align2::CENTER_CENTER, crate::i18n::tr("Presets"), Tokens::ui(12.0), t.text);
         app.auto.add("properties.textPresets", pr, "Text Animation Presets");
-        let ppop = egui::Id::new("props-text-presets-pop");
+        let ppop = egui::Id::unique("props-text-presets-pop");
         if presp.clicked() {
             widgets::open_popup(ui, ppop);
         }
@@ -159,11 +192,10 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     }
 }
 
-fn section_header(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, x0: f32, w: f32, y: f32, title: &str, auto: &str) {
+fn section_header(app: &mut EffectcraftApp, p: &egui::Painter, x0: f32, w: f32, y: f32, title: &str, auto: &str) {
     let t = app.tokens;
     p.text(pos2(x0, y + ROW_H / 2.0), Align2::LEFT_CENTER, title, Tokens::semibold(12.0), t.text);
     let r = Rect::from_min_size(pos2(x0, y), vec2(w, ROW_H));
-    let _ = ui;
     app.auto.add(auto, r, title);
 }
 
@@ -180,6 +212,8 @@ fn triangle(p: &egui::Painter, c: egui::Pos2, left: bool, col: Color32) {
 #[allow(clippy::too_many_arguments)]
 fn transform_row(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, layer: &Layer, pr: &Property, ectx: &EvalCtx, r: Rect, actions: &mut Actions) {
     let t = app.tokens;
+    // The values themselves: red while an expression drives the property (#1306).
+    let vt = t.for_value(pr.has_expression());
     let cy = r.center().y;
     let uid = pr.uid;
     let lid = layer.id.0;
@@ -192,7 +226,7 @@ fn transform_row(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter,
         let cells = [("prev", r.min.x + 4.0), ("key", r.min.x + 16.0), ("next", r.min.x + 28.0)];
         for (what, cx) in cells {
             let cr = Rect::from_center_size(pos2(cx, cy), vec2(12.0, 16.0));
-            let resp = ui.interact(cr, egui::Id::new(("props-nav", uid, what)), Sense::click());
+            let resp = ui.interact(cr, egui::Id::unique(("props-nav", uid, what)), Sense::click());
             let col = if resp.hovered() { t.text } else { t.text_dim };
             match what {
                 "prev" => triangle(p, cr.center(), true, col),
@@ -216,23 +250,41 @@ fn transform_row(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter,
                 match what {
                     "prev" => actions.push(("time.go".into(), json!({"to": "prevKey", "prop": uid}))),
                     "next" => actions.push(("time.go".into(), json!({"to": "nextKey", "prop": uid}))),
-                    _ => actions.push(("prop.toggleKey".into(), json!({"layer": lid, "prop": uid}))),
+                    _ => actions.push(("prop.toggleKey".into(), json!({"layer": lid, "prop": uid, "selected": true}))),
                 }
             }
         }
     } else {
         let swr = Rect::from_center_size(pos2(r.min.x + 16.0, cy), vec2(14.0, 14.0));
-        let resp = ui.interact(swr, egui::Id::new(("props-sw", uid)), Sense::click());
+        let resp = ui.interact(swr, egui::Id::unique(("props-sw", uid)), Sense::click());
         icons::paint(p, swr, Icon::Stopwatch, if resp.hovered() { t.text } else { t.text_dim });
         app.auto.add(&format!("{base}.stopwatch"), swr, &pr.name);
         if resp.clicked() {
-            actions.push(("prop.toggleAnimation".into(), json!({"layer": lid, "prop": uid})));
+            actions.push(("prop.toggleAnimation".into(), json!({"layer": lid, "prop": uid, "selected": true})));
         }
     }
     p.text(pos2(r.min.x + 42.0, cy), Align2::LEFT_CENTER, &pr.name, Tokens::ui(12.0), t.text);
     let vx = r.min.x + (r.width() * 0.5).max(130.0);
+    let label = Rect::from_min_max(pos2(r.min.x + 42.0, r.min.y), pos2(vx - 20.0, r.max.y));
+    let resp = ui.interact(label, egui::Id::unique(("props-label", uid)), Sense::click());
+    crate::a11y::role_name(&resp, egui::accesskit::Role::Button, &pr.name);
+    app.auto.add(&format!("{base}.label"), label, &pr.name);
+    // A double click, or the keyboard's activation (a primary single click is not one).
+    if resp.double_clicked() || (resp.clicked() && !resp.clicked_by(egui::PointerButton::Primary)) {
+        app.ui.timeline.search.clear();
+        app.ui.timeline.scroll_to = Some(crate::state::ScrollTo::Property(uid));
+        if let Err(e) = crate::menus::frontend(app, ui.ctx(), "timeline.revealProps", json!({"props": [{"layer": lid, "prop": uid}]})) {
+            app.ui.status = e;
+        }
+        app.show_panel(PanelKind::Timeline);
+    }
     let merge = format!("props-{uid}");
-    let set = |actions: &mut Actions, v: serde_json::Value| actions.push(("prop.set".into(), json!({"layer": lid, "prop": uid, "value": v, "merge": merge})));
+    // With several layers selected the edit applies to all: a scrub by the same change, a typed
+    // value as it is.
+    let scrub = ui.ctx().dragged_id().is_some() && ui.input(|i| i.pointer.is_decidedly_dragging());
+    let set = |actions: &mut Actions, v: serde_json::Value| {
+        actions.push(("prop.set".into(), json!({"layer": lid, "prop": uid, "value": v, "merge": merge, "selected": true, "offset": scrub})))
+    };
     let value = ectx.value(layer, pr);
     let is_scale = pr.name == "Scale";
     let pct = is_scale || pr.name == "Opacity";
@@ -240,7 +292,7 @@ fn transform_row(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter,
     match &value {
         Value::Scalar(v) if pr.name == "Rotation" || pr.name.ends_with(" Rotation") => {
             let (_, deg) = super::fx_widgets::split_angle(*v);
-            let (rr, dr, nv) = super::fx_widgets::angle_field(ui, pos2(vx, cy - 9.0), egui::Id::new(("props-v", uid)), *v, decimals(deg), &t);
+            let (rr, dr, nv) = super::fx_widgets::angle_field(ui, pos2(vx, cy - 9.0), egui::Id::unique(("props-v", uid)), *v, decimals(deg), &vt);
             app.auto.add(&format!("{base}.value"), dr, &pr.name);
             app.auto.add(&format!("{base}.revolutions"), rr, &pr.name);
             if let Some(nv) = nv {
@@ -249,7 +301,14 @@ fn transform_row(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter,
         }
         Value::Scalar(v) => {
             let range = if pr.name == "Opacity" { (0.0, 100.0) } else { (-1e9, 1e9) };
-            let (vr, nv, _) = widgets::hot_number_at(ui, pos2(vx, cy - 9.0), egui::Id::new(("props-v", uid)), *v, 0.5, range, decimals(*v), suffix, &t);
+            let (vr, nv, _) = widgets::hot_number_at(
+                ui,
+                pos2(vx, cy - 9.0),
+                egui::Id::unique(("props-v", uid)),
+                *v,
+                &widgets::HotSpec { speed: 0.5, range, decimals: decimals(*v), suffix },
+                &vt,
+            );
             app.auto.add(&format!("{base}.value"), vr, &pr.name);
             if let Some(nv) = nv {
                 set(actions, json!(nv));
@@ -259,32 +318,46 @@ fn transform_row(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter,
             let c = value.components();
             let n = if pr.shown_dims > 0 && !(layer.is_3d() && c.len() == 3) { pr.shown_dims as usize } else { c.len() };
             let mut x = vx;
-            let link_id = egui::Id::new(("props-scale-link", lid));
-            let linked = is_scale && ui.data(|d| d.get_temp::<bool>(link_id)).unwrap_or(true);
-            if is_scale {
+            // Scale: the chain link (Constrain Proportions, on by default), sharing the
+            // Timeline's per-property state so both panels agree (#956).
+            let linkable = pr.match_id == "scale";
+            let linked = linkable && !app.ui.timeline.unlinked.contains(&uid);
+            if linkable {
                 // Constrain Proportions toggle, left of the values.
                 let lr = Rect::from_center_size(pos2(x - 12.0, cy), vec2(12.0, 12.0));
-                let resp = ui.interact(lr, link_id.with("btn"), Sense::click());
+                let resp = ui.interact(lr, egui::Id::unique(("props-link", uid)), Sense::click()).on_hover_text(tr("Constrain Proportions"));
                 icons::paint(p, lr, Icon::Link, if linked { t.accent } else { t.text_faint });
                 app.auto.add(&format!("{base}.constrain"), lr, "Constrain Proportions");
-                if resp.clicked() {
-                    ui.data_mut(|d| d.insert_temp(link_id, !linked));
+                if resp.clicked() && !app.ui.timeline.unlinked.remove(&uid) {
+                    app.ui.timeline.unlinked.insert(uid);
                 }
             }
             for d in 0..n.min(c.len()) {
-                let (vr, nv, _) =
-                    widgets::hot_number_at(ui, pos2(x, cy - 9.0), egui::Id::new(("props-v", uid, d)), c[d], 1.0, (-1e9, 1e9), decimals(c[d]), suffix, &t);
+                let (vr, nv, _) = widgets::hot_number_at(
+                    ui,
+                    pos2(x, cy - 9.0),
+                    egui::Id::unique(("props-v", uid, d)),
+                    c[d],
+                    &widgets::HotSpec { speed: 1.0, range: (-1e9, 1e9), decimals: decimals(c[d]), suffix },
+                    &vt,
+                );
                 app.auto.add(&format!("{base}.value.{d}"), vr, &pr.name);
                 if let Some(nv) = nv {
                     let mut nc = c.clone();
-                    if linked && c[d].abs() > 1e-9 {
-                        let k = nv / c[d];
-                        for v in nc.iter_mut().take(n) {
-                            *v *= k;
+                    // Alt edits one value of a linked pair, as in the Timeline.
+                    let shown = if linked && !ui.input(|i| i.modifiers.alt && !widgets::proportional_scrub(i.modifiers)) { n.min(c.len()) } else { 1 };
+                    let from = if shown == 1 { d } else { 0 };
+                    for (e, v) in widgets::constrained(c.get(from..from + shown).unwrap_or_default(), d - from, nv).into_iter().enumerate() {
+                        if let Some(slot) = nc.get_mut(from + e) {
+                            *slot = v;
                         }
                     }
-                    nc[d] = nv;
                     set(actions, json!(nc));
+                    // Typed into these components only: other selected layers keep the rest of
+                    // their own value (#1434).
+                    if let Some((_, a)) = actions.last_mut() {
+                        a["dims"] = json!((from..from + shown).collect::<Vec<_>>());
+                    }
                 }
                 x = vr.max.x + 10.0;
             }
@@ -313,24 +386,18 @@ fn text_section(
         v["layer"] = json!(lid);
         actions.push(("layer.setText".into(), v));
     };
-    section_header(app, ui, p, x0, w, y, "Text", "properties.text");
+    section_header(app, p, x0, w, y, "Text", "properties.text");
     y += ROW_H + 4.0;
     // Font family and style.
     let fr = Rect::from_min_size(pos2(x0, y), vec2(w, 22.0));
-    let pop = egui::Id::new("props-font-pop");
-    if widgets::dropdown(ui, fr, &doc.font, &t, egui::Id::new("props-font")).clicked() {
-        widgets::open_popup(ui, pop);
-    }
-    app.auto.add("properties.text.font", fr, "Font family");
-    // Every installed family (built only while the menu is open: it can be long).
-    let fams: Vec<String> = if widgets::popup_is_open(ui, pop) { effectcraft_engine::text_families() } else { vec![] };
-    if let Some(f) = widgets::popup_menu(ui, pop, fr.left_bottom(), &fams, fams.iter().position(|f| *f == doc.font)).and_then(|i| fams.get(i)) {
+    let pop = egui::Id::unique("props-font-pop");
+    if let Some(f) = super::text_panels::font_picker(app, ui, pop, fr, &doc.font, "properties.text.font", true) {
         set(actions, json!({"font": f}));
     }
     y += 28.0;
     let sr = Rect::from_min_size(pos2(x0, y), vec2(w, 22.0));
-    let spop = egui::Id::new("props-style-pop");
-    if widgets::dropdown(ui, sr, &doc.style, &t, egui::Id::new("props-style")).clicked() {
+    let spop = egui::Id::unique("props-style-pop");
+    if widgets::dropdown(ui, sr, &doc.style, &t, egui::Id::unique("props-style")).clicked() {
         widgets::open_popup(ui, spop);
     }
     app.auto.add("properties.text.style", sr, "Font style");
@@ -344,7 +411,14 @@ fn text_section(
     let col2 = x0 + w / 2.0;
     let field = |app: &mut EffectcraftApp, ui: &mut egui::Ui, x: f32, y: f32, glyph: &str, key: &str, v: f64, range: (f64, f64), suffix: &str| {
         p.text(pos2(x, y + 9.0), Align2::LEFT_CENTER, glyph, Tokens::semibold(11.0), t.text_dim);
-        let (r, nv, _) = widgets::hot_number_at(ui, pos2(x + 26.0, y), egui::Id::new(("props-text", key)), v, 0.5, range, decimals(v), suffix, &t);
+        let (r, nv, _) = widgets::hot_number_at(
+            ui,
+            pos2(x + 26.0, y),
+            egui::Id::unique(("props-text", key)),
+            v,
+            &widgets::HotSpec { speed: 0.5, range, decimals: decimals(v), suffix },
+            &t,
+        );
         app.auto.add(&format!("properties.text.{key}"), r, key);
         nv
     };
@@ -361,8 +435,14 @@ fn text_section(
             // Auto Leading: click to switch to an explicit value (120% of the size).
             p.text(pos2(col2, y + 9.0), Align2::LEFT_CENTER, "A", Tokens::semibold(11.0), t.text_dim);
             let r = Rect::from_min_size(pos2(col2 + 26.0, y), vec2(40.0, 18.0));
-            let resp = ui.interact(r, egui::Id::new("props-leading-auto"), Sense::click());
-            p.text(pos2(r.min.x + 2.0, r.center().y), Align2::LEFT_CENTER, "Auto", Tokens::ui(12.0), if resp.hovered() { t.accent_hover } else { t.hot_text });
+            let resp = ui.interact(r, egui::Id::unique("props-leading-auto"), Sense::click());
+            p.text(
+                pos2(r.min.x + 2.0, r.center().y),
+                Align2::LEFT_CENTER,
+                crate::i18n::tr("Auto"),
+                Tokens::ui(12.0),
+                if resp.hovered() { t.accent_hover } else { t.hot_text },
+            );
             app.auto.add("properties.text.leading", r, "leading");
             if resp.clicked() {
                 set(actions, json!({"leading": (doc.size * 1.2).round()}));
@@ -381,19 +461,19 @@ fn text_section(
     for (i, (key, label, on, c)) in [("fill", "Fill", doc.apply_fill, doc.fill), ("stroke", "Stroke", doc.apply_stroke, doc.stroke)].into_iter().enumerate() {
         let ry = y + i as f32 * 24.0;
         let cr = Rect::from_min_size(pos2(x0, ry + 2.0), vec2(14.0, 14.0));
-        if widgets::checkbox(ui, cr, on, &t, egui::Id::new(("props-apply", key))).clicked() {
+        if widgets::checkbox(ui, cr, on, &t, egui::Id::unique(("props-apply", key))).changed() {
             let k = if key == "fill" { "applyFill" } else { "applyStroke" };
             set(actions, json!({k: !on}));
         }
         app.auto.add(&format!("properties.text.{key}.enabled"), cr, label);
         let sw = Rect::from_min_size(pos2(x0 + 24.0, ry + 1.0), vec2(16.0, 16.0));
-        let pop = egui::Id::new(("props-color-pop", key));
-        if widgets::swatch(ui, sw, c, egui::Id::new(("props-color", key)), &t).clicked() {
+        let pop = egui::Id::unique(("props-color-pop", key));
+        if widgets::swatch(ui, sw, c, egui::Id::unique(("props-color", key)), &t).clicked() {
             widgets::open_popup(ui, pop);
         }
         app.auto.add(&format!("properties.text.{key}"), sw, label);
         let mut rgb = [c[0], c[1], c[2]];
-        if crate::header::color_popup(ui, pop, sw.left_bottom(), &mut rgb) {
+        if crate::widgets::color_popup(ui, pop, sw.left_bottom(), &mut rgb) {
             set(actions, json!({key: [rgb[0], rgb[1], rgb[2]], "merge": format!("props-text-{key}")}));
         }
         p.text(pos2(sw.max.x + 8.0, sw.center().y), Align2::LEFT_CENTER, label, Tokens::ui(12.0), t.text);
@@ -417,12 +497,12 @@ fn paragraph_section(
     actions: &mut Actions,
 ) -> f32 {
     let t = app.tokens;
-    section_header(app, ui, p, x0, w, y, "Paragraph", "properties.paragraph");
+    section_header(app, p, x0, w, y, "Paragraph", "properties.paragraph");
     y += ROW_H + 4.0;
     for (i, (j, key)) in ALIGNS.into_iter().enumerate() {
         let r = Rect::from_min_size(pos2(x0 + i as f32 * 26.0, y), vec2(22.0, 22.0));
         let on = doc.justify == j;
-        let resp = ui.interact(r, egui::Id::new(("props-para", key)), Sense::click());
+        let resp = ui.interact(r, egui::Id::unique(("props-para", key)), Sense::click());
         p.rect_filled(
             r,
             3.0,
@@ -477,10 +557,10 @@ fn paint_align_glyph(p: &egui::Painter, r: Rect, j: Justify, c: Color32) {
 fn more_button(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, x0: f32, y: f32, id: &str, auto: &str, panel: PanelKind) -> f32 {
     let t = app.tokens;
     let r = Rect::from_min_size(pos2(x0, y), vec2(64.0, 22.0));
-    let resp = ui.interact(r, egui::Id::new(id), Sense::click());
+    let resp = ui.interact(r, egui::Id::unique(id), Sense::click());
     p.rect_filled(r, 4.0, if resp.hovered() { t.hover } else { t.field_bg });
     p.text(pos2(r.min.x + 8.0, r.center().y), Align2::LEFT_CENTER, "···", Tokens::semibold(12.0), t.text);
-    p.text(pos2(r.min.x + 26.0, r.center().y), Align2::LEFT_CENTER, "More", Tokens::ui(12.0), t.text);
+    p.text(pos2(r.min.x + 26.0, r.center().y), Align2::LEFT_CENTER, crate::i18n::tr("More"), Tokens::ui(12.0), t.text);
     app.auto.add(auto, r, "More");
     if resp.clicked() {
         app.show_panel(panel);

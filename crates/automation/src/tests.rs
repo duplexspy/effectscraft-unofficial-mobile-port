@@ -36,6 +36,72 @@ fn call_json(s: &mut McpServer, name: &str, args: Value) -> Value {
 }
 
 #[test]
+fn property_group_error_points_to_layer_inspection() {
+    let mut s = server();
+    call_json(&mut s, "execute_command", json!({"command": "comp.new", "params": {"name": "Main"}}));
+    let l = call_json(&mut s, "execute_command", json!({"command": "layer.newText", "params": {"text": "Hi"}}))["layer"].clone();
+    call_json(&mut s, "execute_command", json!({"command": "comp.renderer", "params": {"renderer": "advanced3d"}}));
+    for tool in ["get_property", "set_property", "add_keyframe"] {
+        let mut args = json!({"layer": l, "path": "geometryOptions", "time": 0});
+        if tool != "get_property" {
+            args["value"] = json!(0);
+        }
+        let (content, err) = call(&mut s, tool, args);
+        assert!(err, "{tool}: {content:?}");
+        let text = content[0]["text"].as_str().unwrap();
+        assert!(text.contains("is a property group"), "{tool}: {text}");
+        assert!(text.contains("get_layer"), "{tool}: {text}");
+    }
+    let tree = call_json(&mut s, "get_layer", json!({"layer": l, "flat": true}));
+    assert!(tree["properties"].as_array().unwrap().iter().any(|p| p["path"] == "geometryOptions/extrusionDepth"));
+    assert!(call_json(&mut s, "get_property", json!({"layer": l, "path": "geometryOptions/extrusionDepth"}))["value"].is_number());
+}
+
+/// Enum properties list their values and labels, so a client can set one without guessing (#2085).
+#[test]
+fn enum_properties_list_their_options() {
+    let mut s = server();
+    call_json(&mut s, "execute_command", json!({"command": "comp.new", "params": {"name": "probe"}}));
+    call_json(&mut s, "execute_command", json!({"command": "layer.newText", "params": {"name": "T", "text": "Hello"}}));
+    call_json(&mut s, "execute_command", json!({"command": "layer.addTextAnimator", "params": {"layer": "T", "properties": ["opacity"], "name": "A"}}));
+    let path = "text/animators/animator/selectors/rangeSelector/advanced/shape";
+    let shapes = ["Square", "Ramp Up", "Ramp Down", "Triangle", "Round", "Smooth"];
+    let expected = json!(shapes.iter().enumerate().map(|(value, label)| json!({"value": value, "label": label})).collect::<Vec<_>>());
+
+    let p = call_json(&mut s, "get_property", json!({"layer": "T", "path": path}));
+    assert_eq!(p["type"], "enum");
+    assert_eq!(p["options"], expected, "{p}");
+    let opacity = call_json(&mut s, "get_property", json!({"layer": "T", "path": "transform/opacity"}));
+    assert!(opacity.get("options").is_none(), "{opacity}");
+
+    fn find<'a>(node: &'a Value, path: &str) -> Option<&'a Value> {
+        if node["path"] == path {
+            return Some(node);
+        }
+        node["children"].as_array()?.iter().find_map(|c| find(c, path))
+    }
+    let tree = call_json(&mut s, "get_layer", json!({"layer": "T"}));
+    let node = find(&tree["properties"], path).unwrap_or_else(|| panic!("{tree}"));
+    assert_eq!(node["options"], expected);
+    assert!(find(&tree["properties"], "transform/opacity").unwrap()["options"].is_null());
+
+    let flat = call_json(&mut s, "get_layer", json!({"layer": "T", "flat": true}));
+    let props = flat["properties"].as_array().unwrap();
+    assert_eq!(props.iter().find(|p| p["path"] == path).unwrap()["options"], expected);
+    assert!(props.iter().find(|p| p["path"] == "transform/opacity").unwrap().get("options").is_none());
+
+    // Path Options ▸ Path offers None and the layer's masks, as the Timeline does.
+    for _ in 0..2 {
+        call_json(&mut s, "execute_command", json!({"command": "mask.new", "params": {"layer": "T", "vertices": [[0, 0], [40, 0], [40, 40]], "closed": true}}));
+    }
+    let masks = json!([{"value": 0, "label": "None"}, {"value": 1, "label": "Mask 1"}, {"value": 2, "label": "Mask 2"}]);
+    let p = call_json(&mut s, "get_property", json!({"layer": "T", "path": "text/pathOptions/path"}));
+    assert_eq!(p["options"], masks, "{p}");
+    let tree = call_json(&mut s, "get_layer", json!({"layer": "T"}));
+    assert_eq!(find(&tree["properties"], "text/pathOptions/path").unwrap_or_else(|| panic!("{tree}"))["options"], masks);
+}
+
+#[test]
 fn initialize_and_list_tools() {
     let mut s = server();
     let r = rpc(&mut s, 1, "initialize", json!({"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}));
@@ -135,6 +201,21 @@ fn headless_workflow() {
     let mid = call_json(&mut s, "get_property", json!({"layer": l, "path": "transform/position", "time": 1.0}));
     assert!((mid["value"][0].as_f64().unwrap() - 160.0).abs() < 1.0, "{mid}");
 
+    // Comp-time keys on an offset layer (#257): the key lands where the Timeline shows it.
+    call_json(&mut s, "execute_command", json!({"command": "layer.timing", "params": {"layer": l, "start": 1.0}}));
+    let p = call_json(
+        &mut s,
+        "add_keyframe",
+        json!({"layer": l, "path": "transform/scale", "keys": [{"time": 1.5, "value": [50, 50]}, {"time": 2.5, "value": [100, 100]}], "timeBase": "comp", "interpolation": "hold"}),
+    );
+    let times: Vec<f64> = p["keys"].as_array().unwrap().iter().map(|k| k["time"].as_f64().unwrap()).collect();
+    // Comp times snap to the comp's frames (29.97 fps) before becoming layer time.
+    assert!((times[0] - 0.5).abs() < 0.02 && (times[1] - 1.5).abs() < 0.02, "layer-time keys: {times:?}");
+    assert_eq!(p["keys"][0]["out"], "Hold", "the comp-time keys were selected for the interpolation");
+    call_json(&mut s, "set_property", json!({"layer": l, "path": "transform/scale", "value": [75, 75], "time": 3.0, "timeBase": "comp"}));
+    let p = call_json(&mut s, "get_property", json!({"layer": l, "path": "transform/scale"}));
+    assert!(p["keys"].as_array().unwrap().iter().any(|k| (k["time"].as_f64().unwrap() - 2.0).abs() < 0.02), "{p}");
+
     // Expression via set_property.
     let p = call_json(&mut s, "set_property", json!({"layer": l, "path": "transform/rotation", "expression": "time * 90"}));
     assert_eq!(p["expression"], "time * 90");
@@ -211,11 +292,213 @@ fn stdio_loop() {
     .map(|v| v.to_string() + "\n")
     .collect::<String>();
     let mut out = Vec::new();
-    s.serve(input.as_bytes(), &mut out).unwrap();
+    s.serve(std::io::Cursor::new(input), &mut out).unwrap();
     let lines: Vec<Value> = String::from_utf8(out).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
     assert_eq!(lines.len(), 2);
     assert_eq!(lines[1]["id"], 2);
     assert_eq!(lines[1]["result"]["isError"], false);
+}
+
+/// Regression for #258: a dirty headless project must survive an MCP disconnect.
+#[test]
+fn headless_autosave_on_eof_preserves_unsaved_project() {
+    let dir = std::env::temp_dir().join(format!("ec-mcp-autosave-eof-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut s = server().with_autosave(&dir).unwrap();
+    let input = [
+        json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "execute_command", "arguments": {"command": "comp.new", "params": {"name": "Keep my work", "width": 320, "height": 180}}}}),
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "execute_command", "arguments": {"command": "layer.newText", "params": {"text": "Unsaved title"}}}}),
+    ].iter().map(|v| v.to_string() + "\n").collect::<String>();
+    let mut output = Vec::new();
+    s.serve(std::io::Cursor::new(input), &mut output).unwrap();
+    let path = s.backend().session().unwrap().autosave.last_path.clone();
+    assert!(path.is_some(), "disconnect discarded the dirty project without an auto-save");
+    let path = path.unwrap();
+    let mut fresh = server();
+    call_json(&mut fresh, "open_project", json!({"path": path}));
+    let comp = call_json(&mut fresh, "get_comp", json!({"comp": "Keep my work"}));
+    assert_eq!(comp["layers"].as_array().unwrap().len(), 1);
+    assert!(s.backend().session().unwrap().is_dirty(), "an auto-save must not mark the original project saved");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+fn autosave_test_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("ec-mcp-autosave-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn autosave_status(s: &mut McpServer) -> Value {
+    rpc(s, 1, "initialize", json!({}))["_meta"]["effectcraftAutoSave"].clone()
+}
+
+#[test]
+fn autosave_is_durable_before_reply_and_queries_do_not_rotate() {
+    let dir = autosave_test_dir("durable");
+    let mut s = server().with_autosave(&dir).unwrap();
+    call_json(&mut s, "execute_command", json!({"command": "comp.new", "params": {"name": "Durable"}}));
+    let first = autosave_status(&mut s);
+    let path = first["latestPath"].as_str().unwrap();
+    assert!(std::fs::read_to_string(path).unwrap().contains("Durable"));
+    let summary = call_json(&mut s, "get_project", json!({}));
+    assert_eq!(summary["autosave"]["latestPath"], path);
+    assert_eq!(summary["path"], Value::Null);
+    assert_eq!(summary["dirty"], true);
+    assert_eq!(autosave_status(&mut s)["latestPath"], path);
+    assert!(s.backend().session().unwrap().config.is_none());
+    drop(s); // Abrupt process loss has no EOF cleanup; the checkpoint already exists.
+    let mut restarted = server().with_autosave(&dir).unwrap();
+    let init = rpc(&mut restarted, 1, "initialize", json!({}));
+    // The instructions carry the auto-save state as JSON, where a Windows path's backslashes
+    // are escaped.
+    assert!(init["instructions"].as_str().unwrap().contains(&Value::from(path).to_string()));
+    assert_eq!(init["_meta"]["effectcraftAutoSave"]["previousSessions"][0]["autosave"], path);
+    call_json(&mut restarted, "open_project", json!({"path": path}));
+    assert_eq!(call_json(&mut restarted, "get_project", json!({}))["items"][0]["name"], "Durable");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn autosave_errors_preserve_tool_success_retry_and_fail_shutdown() {
+    let dir = autosave_test_dir("write-error");
+    let mut s = server().with_autosave(&dir).unwrap();
+    let folder = std::path::PathBuf::from(autosave_status(&mut s)["folder"].as_str().unwrap());
+    std::fs::remove_dir(&folder).unwrap();
+    std::fs::write(&folder, "blocked by file").unwrap();
+    let (content, failed) = call(&mut s, "execute_command", json!({"command": "comp.new", "params": {"name": "Still in memory"}}));
+    assert!(!failed, "the edit succeeded even though its checkpoint failed");
+    assert!(content.iter().any(|c| c["text"].as_str().unwrap_or("").contains("Warning:")));
+    assert!(s.backend().session().unwrap().is_dirty());
+    assert!(autosave_status(&mut s)["error"].as_str().unwrap().contains("failed"));
+    let error = s.serve(&b""[..], Vec::new()).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::Other);
+    assert!(error.to_string().contains("MCP auto-save"));
+    std::fs::remove_file(&folder).unwrap();
+    // Even a query retries the outstanding dirty revision.
+    let summary = call_json(&mut s, "get_project", json!({}));
+    assert_eq!(summary["autosave"]["error"], Value::Null);
+    let path = summary["autosave"]["latestPath"].as_str().unwrap();
+    assert!(std::fs::read_to_string(path).unwrap().contains("Still in memory"));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn autosave_keeps_sessions_and_desktop_recovery_separate() {
+    let dir = autosave_test_dir("isolated");
+    let desktop_save = dir.join(effectcraft_engine::autosave::AUTOSAVE_FOLDER).join("Untitled Project auto-save 1.ecproj");
+    std::fs::create_dir_all(desktop_save.parent().unwrap()).unwrap();
+    std::fs::write(&desktop_save, "desktop backup").unwrap();
+    std::fs::write(dir.join("session.lock"), "desktop sentinel").unwrap();
+    let mut a = server().with_autosave(&dir).unwrap();
+    let mut b = server().with_autosave(&dir).unwrap();
+    assert_ne!(autosave_status(&mut a)["folder"], autosave_status(&mut b)["folder"]);
+    for index in 0..7 {
+        for (s, name) in [(&mut a, "A"), (&mut b, "B")] {
+            call_json(s, "execute_command", json!({"command": "comp.new", "params": {"name": format!("{name}{index}")}}));
+        }
+    }
+    for (s, mine, other) in [(&mut a, "A6", "B6"), (&mut b, "B6", "A6")] {
+        let status = autosave_status(s);
+        let json = std::fs::read_to_string(status["latestPath"].as_str().unwrap()).unwrap();
+        assert!(json.contains(mine));
+        assert!(!json.contains(other));
+        let folder = std::path::Path::new(status["folder"].as_str().unwrap());
+        assert_eq!(effectcraft_engine::autosave::existing(folder, "Untitled Project").len(), 5);
+    }
+    assert_eq!(std::fs::read_to_string(desktop_save).unwrap(), "desktop backup");
+    assert_eq!(std::fs::read_to_string(dir.join("session.lock")).unwrap(), "desktop sentinel");
+    assert!(!dir.join("prefs.json").exists());
+    assert!(!dir.join("shortcuts.json").exists());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn autosave_marks_saved_or_undone_work_clean_without_losing_its_path() {
+    let dir = autosave_test_dir("clean");
+    let mut s = server().with_autosave(&dir).unwrap();
+    call_json(&mut s, "execute_command", json!({"command": "comp.new", "params": {"name": "Undo me"}}));
+    let status = autosave_status(&mut s);
+    let folder = std::path::Path::new(status["folder"].as_str().unwrap());
+    call_json(&mut s, "undo", json!({}));
+    let manifest: Value = serde_json::from_str(&std::fs::read_to_string(folder.join("session.json")).unwrap()).unwrap();
+    assert_eq!(manifest["dirty"], false);
+    call_json(&mut s, "redo", json!({}));
+    let path = autosave_status(&mut s)["latestPath"].clone();
+    call_json(&mut s, "save_project", json!({"path": dir.join("Saved.ecproj")}));
+    assert_eq!(autosave_status(&mut s)["latestPath"], path, "save resets the engine bookkeeping but the server remembers the recovery file");
+    let manifest: Value = serde_json::from_str(&std::fs::read_to_string(folder.join("session.json")).unwrap()).unwrap();
+    assert_eq!(manifest["dirty"], false);
+    let mut next = server().with_autosave(&dir).unwrap();
+    assert!(autosave_status(&mut next)["previousSessions"].as_array().unwrap().is_empty());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A reply that cannot be written ends `serve` with the write error, even while stdin stays open
+/// (the client is gone but never closed its end): the reader thread must not be waited for.
+#[test]
+fn broken_output_returns_while_stdin_stays_open() {
+    struct Broken;
+    impl Write for Broken {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let (in_r, mut in_w) = std::io::pipe().unwrap();
+    writeln!(in_w, "{}", json!({"jsonrpc": "2.0", "id": 1, "method": "ping"})).unwrap();
+    let (done_tx, done) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done_tx.send(server().serve(BufReader::new(in_r), Broken));
+    });
+    let result = done.recv_timeout(std::time::Duration::from_secs(10)).expect("serve must return while stdin is still open");
+    assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
+    drop(in_w);
+}
+
+#[test]
+fn autosave_flushes_on_read_errors_and_broken_output() {
+    struct Broken;
+    impl Write for Broken {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let dir = autosave_test_dir("transports");
+    for invalid_input in [true, false] {
+        let mut s = server().with_autosave(&dir).unwrap();
+        // Simulate an edit whose client went away before it received a tool response.
+        s.backend().exec("comp.new", json!({"name": "Transport failure"})).unwrap();
+        let error = if invalid_input {
+            s.serve(&b"\xff\n"[..], Vec::new()).unwrap_err()
+        } else {
+            s.serve(&b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n"[..], Broken).unwrap_err()
+        };
+        assert_eq!(error.kind(), if invalid_input { std::io::ErrorKind::InvalidData } else { std::io::ErrorKind::BrokenPipe });
+        let status = autosave_status(&mut s);
+        assert!(std::fs::read_to_string(status["latestPath"].as_str().unwrap()).unwrap().contains("Transport failure"));
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+fn fake_render_frame(session: &Session, params: &Value) -> Value {
+    let png = crate::encode_png(4, 2, vec![255; 32], 0).unwrap();
+    if params["write"] == true {
+        let Some(path) = params["path"].as_str() else { return json!({"ok": false, "error": "missing output path"}) };
+        if let Err(error) = session.write_output(path, &png) {
+            return json!({"ok": false, "error": error.to_string()});
+        }
+    }
+    let mut result = json!({"comp": 1, "time": 0.5, "width": 4, "height": 2, "png": base64::encode(&png)});
+    if params["write"] == true {
+        result["path"] = params["path"].clone();
+    }
+    json!({"ok": true, "result": result})
 }
 
 /// A fake desktop control channel: answers `engine.execute` from a real session, and canned
@@ -235,10 +518,7 @@ fn fake_app() -> u16 {
                     Ok(v) => json!({"ok": true, "result": v}),
                     Err(e) => json!({"ok": false, "error": e.to_string()}),
                 },
-                "render.frame" => {
-                    let png = crate::encode_png(4, 2, vec![255; 32], 0).unwrap();
-                    json!({"ok": true, "result": {"comp": 1, "time": 0.5, "width": 4, "height": 2, "png": base64::encode(&png)}})
-                }
+                "render.frame" => fake_render_frame(&session, p),
                 "ui.screenshot" => {
                     let png = crate::encode_png(8, 8, vec![128; 256], 0).unwrap();
                     std::fs::write(p["path"].as_str().unwrap(), png).unwrap();
@@ -267,6 +547,8 @@ fn bridge_forwards_to_control_channel() {
 
     call_json(&mut s, "execute_command", json!({"command": "comp.new", "params": {"name": "B", "width": 64, "height": 64}}));
     assert_eq!(call_json(&mut s, "get_comp", json!({}))["name"], "B");
+    let cmds = call_json(&mut s, "list_commands", json!({"filter": "layer.newSolid", "compact": true}));
+    assert!(cmds.as_array().unwrap().contains(&json!({"id": "layer.newSolid", "label": "Solid..."})), "{cmds}");
 
     let (c, err) = call(&mut s, "render_frame", json!({}));
     assert!(!err, "{c:?}");
@@ -285,6 +567,128 @@ fn bridge_forwards_to_control_channel() {
 fn bridge_rejects_non_loopback() {
     assert!(Backend::bridge("10.0.0.1:9877").is_err());
     assert!(Backend::bridge("localhost:9877").is_ok());
+}
+
+/// The app applies the first request but loses its reply. The next connection can be either
+/// an automatic retry or an explicit follow-up; the returned counts distinguish them.
+fn lost_reply_server(first_reply: Option<&'static str>) -> (String, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let worker = std::thread::spawn(move || {
+        let mut session = Session::default();
+        let mut mutations = 0;
+        for attempt in 0..2 {
+            let (stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            let mut output = stream.try_clone().unwrap();
+            let mut input = String::new();
+            BufReader::new(stream).read_line(&mut input).unwrap();
+            let request: Value = serde_json::from_str(&input).unwrap();
+            let result = if request["method"] == "engine.execute" {
+                mutations += 1;
+                session.execute(request["params"]["command"].as_str().unwrap(), request["params"]["params"].clone()).unwrap()
+            } else if request["method"] == "ui.inspect" || (request["method"] == "ui.playback" && request["params"]["action"] == "status") {
+                json!({"mutations": mutations, "requests": attempt + 1, "comps": session.project.comps().count()})
+            } else {
+                mutations += 1;
+                json!({"mutations": mutations})
+            };
+            if attempt == 1 {
+                writeln!(output, "{}", json!({"id": request["id"], "ok": true, "result": result})).unwrap();
+            } else if let Some(reply) = first_reply {
+                writeln!(output, "{reply}").unwrap();
+            }
+        }
+    });
+    (addr, worker)
+}
+
+#[test]
+fn bridge_does_not_replay_a_mutation_when_its_reply_is_lost() {
+    let (addr, worker) = lost_reply_server(None);
+    let mut backend = Backend::bridge(&addr).unwrap();
+    let error = backend.exec("comp.new", json!({"width": 64, "height": 48, "duration": 1})).unwrap_err();
+    assert!(error.to_string().contains("outcome is unknown"), "{error}");
+    let state = backend.control("ui.inspect", json!({})).unwrap();
+    assert_eq!(state["mutations"], 1, "the first command was applied exactly once");
+    assert_eq!(state["comps"], 1);
+    worker.join().unwrap();
+}
+
+#[test]
+fn bridge_retries_read_only_queries_after_a_lost_reply() {
+    let (addr, worker) = lost_reply_server(None);
+    let mut backend = Backend::bridge(&addr).unwrap();
+    let state = backend.control("ui.inspect", json!({})).unwrap();
+    assert_eq!(state["requests"], 2);
+    assert_eq!(state["mutations"], 0);
+    worker.join().unwrap();
+}
+
+#[test]
+fn bridge_reports_unknown_outcome_after_a_malformed_mutation_reply() {
+    let (addr, worker) = lost_reply_server(Some("{invalid reply"));
+    let mut backend = Backend::bridge(&addr).unwrap();
+    let error = backend.exec("comp.new", json!({"width": 64, "height": 48, "duration": 1})).unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("outcome is unknown") && message.contains("bad reply"), "{message}");
+    assert_eq!(backend.control("ui.inspect", json!({})).unwrap()["comps"], 1);
+    worker.join().unwrap();
+}
+
+#[test]
+fn bridge_does_not_assume_an_unknown_method_is_read_only() {
+    let (addr, worker) = lost_reply_server(None);
+    let mut backend = Backend::bridge(&addr).unwrap();
+    let error = backend.control("future.customOperation", json!({})).unwrap_err();
+    assert!(error.to_string().contains("outcome is unknown"), "{error}");
+    assert_eq!(backend.control("ui.inspect", json!({})).unwrap()["mutations"], 1);
+    worker.join().unwrap();
+}
+
+#[test]
+fn bridge_playback_edits_and_default_toggle_are_not_replayed() {
+    for params in [json!({}), json!({"action": "toggle"}), json!({"action": "play"}), json!({"action": "stop"})] {
+        let (addr, worker) = lost_reply_server(None);
+        let mut backend = Backend::bridge(&addr).unwrap();
+        let error = backend.control("ui.playback", params).unwrap_err();
+        assert!(error.to_string().contains("outcome is unknown"), "{error}");
+        assert_eq!(backend.control("ui.inspect", json!({})).unwrap()["mutations"], 1);
+        worker.join().unwrap();
+    }
+}
+
+#[test]
+fn bridge_playback_status_can_be_retried() {
+    let (addr, worker) = lost_reply_server(None);
+    let mut backend = Backend::bridge(&addr).unwrap();
+    let state = backend.control("ui.playback", json!({"action": "status"})).unwrap();
+    assert_eq!(state["requests"], 2);
+    assert_eq!(state["mutations"], 0);
+    worker.join().unwrap();
+}
+
+#[test]
+fn bridge_connect_failure_can_be_retried_when_the_app_starts() {
+    let reserved = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = reserved.local_addr().unwrap();
+    drop(reserved);
+    let mut backend = Backend::bridge(&addr.to_string()).unwrap();
+    let error = backend.control("ui.inspect", json!({})).unwrap_err();
+    assert!(error.to_string().contains("cannot connect"), "{error}");
+    assert!(!error.to_string().contains("outcome is unknown"), "nothing was sent");
+    let listener = TcpListener::bind(addr).unwrap();
+    let worker = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        let mut output = stream.try_clone().unwrap();
+        let mut input = String::new();
+        BufReader::new(stream).read_line(&mut input).unwrap();
+        let request: Value = serde_json::from_str(&input).unwrap();
+        writeln!(output, "{}", json!({"id": request["id"], "ok": true, "result": {"ready": true}})).unwrap();
+    });
+    assert_eq!(backend.control("ui.inspect", json!({})).unwrap()["ready"], true);
+    worker.join().unwrap();
 }
 
 #[test]
@@ -392,6 +796,40 @@ fn every_engine_command_is_reachable_over_mcp() {
     }
 }
 
+/// `compact: true` shrinks the listings for MCP clients' tool-result limits (#2020): commands with
+/// only `id` and `label`, effects with only `id`, `name` and `category`.
+#[test]
+fn compact_listings_keep_only_ids_and_names() {
+    let mut s = server();
+    let cmds = call_json(&mut s, "list_commands", json!({"filter": "layer.new", "compact": true}));
+    assert!(cmds.as_array().unwrap().contains(&json!({"id": "layer.newSolid", "label": "Solid..."})), "{cmds}");
+    let fx = call_json(&mut s, "list_effects", json!({"filter": "gaussian", "compact": true}));
+    assert!(fx.as_array().unwrap().contains(&json!({"id": "ec.blur.gaussian", "name": "Gaussian Blur", "category": "Blur & Sharpen"})), "{fx}");
+    // Each compact listing is the full one with the same arguments, entry for entry; `compact`
+    // wins over `schemas`.
+    let check = |s: &mut McpServer, tool: &str, args: Value, keys: &[&str]| {
+        let full = call_json(s, tool, args.clone());
+        let want: Value = full.as_array().unwrap().iter().map(|e| Value::Object(keys.iter().map(|&k| (k.to_string(), e[k].clone())).collect())).collect();
+        let mut compact = args.clone();
+        compact["compact"] = json!(true);
+        assert_eq!(call_json(s, tool, compact), want, "{tool} {args}");
+    };
+    for args in [json!({}), json!({"filter": "layer.new"}), json!({"enabled_only": true}), json!({"schemas": true})] {
+        check(&mut s, "list_commands", args.clone(), &["id", "label"]);
+        check(&mut s, "command_list", args, &["id", "label"]);
+    }
+    check(&mut s, "list_effects", json!({}), &["id", "name", "category"]);
+    check(&mut s, "list_effects", json!({"filter": "gaussian"}), &["id", "name", "category"]);
+    // `compact: false` is the default listing, byte for byte; `compact: true` is a fraction of it.
+    let text = |s: &mut McpServer, tool: &str, args: Value| call(s, tool, args).0[0]["text"].as_str().unwrap().to_string();
+    for (tool, ratio) in [("list_commands", 2), ("list_effects", 10)] {
+        let full = text(&mut s, tool, json!({}));
+        assert_eq!(text(&mut s, tool, json!({"compact": false})), full, "{tool}");
+        let compact = text(&mut s, tool, json!({"compact": true})).len();
+        assert!(compact * ratio < full.len(), "{tool}: {compact} of {} bytes", full.len());
+    }
+}
+
 #[test]
 fn high_level_tools_add_effect_and_report_state() {
     let mut s = server();
@@ -457,6 +895,12 @@ fn list_fonts_lists_families_with_styles() {
     assert!(matched.len() < fams.len(), "the query filters: {one}");
     let mono = matched.iter().find(|f| f["family"] == "JetBrains Mono").unwrap_or_else(|| panic!("{one}"));
     assert!(mono["styles"].as_array().unwrap().contains(&json!("Regular")), "{one}");
+    assert_eq!(mono["variable"], false, "{one}");
+    // `variable` keeps only the variable fonts (the font menu's filter); the static bundled
+    // families drop out.
+    let var = call_json(&mut s, "list_fonts", json!({"variable": true}));
+    let listed = var["families"].as_array().unwrap();
+    assert!(listed.iter().all(|f| f["variable"] == true && f["family"] != "Inter"), "{var}");
 }
 
 /// Trained models over MCP (Roto Brush and face tracking): listed with their authors and
@@ -506,4 +950,918 @@ fn agents_doc_tools_table_is_current() {
         }
     }
     assert!(missing.is_empty(), "docs/agents.md's Tools table is missing: {missing:#?}");
+}
+
+#[test]
+fn autosave_checkpoints_batch_and_partially_failed_tools() {
+    let dir = autosave_test_dir("partial");
+    let mut s = server().with_autosave(&dir).unwrap();
+    let msgs = json!([
+        {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"execute_command","arguments":{"command":"comp.new","params":{"name":"Batch"}}}},
+        {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"execute_command","arguments":{"command":"layer.newText","params":{"text":"Batch title"}}}}
+    ]);
+    let reply = s.handle(&msgs).unwrap();
+    assert_eq!(reply.as_array().unwrap().len(), 2);
+    let (_, failed) = call(&mut s, "add_keyframe", json!({"layer":"#1","path":"transform/opacity","keys":[{"time":0,"value":37}],"interpolation":"invalid"}));
+    assert!(failed, "the key was added, then the interpolation failed");
+    let status = autosave_status(&mut s);
+    let mut recovered = server();
+    call_json(&mut recovered, "open_project", json!({"path":status["latestPath"]}));
+    let prop = call_json(&mut recovered, "get_property", json!({"layer":"#1","path":"transform/opacity"}));
+    assert_eq!(prop["keys"].as_array().unwrap().len(), 1);
+    assert_eq!(prop["keys"][0]["value"], 37.0);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn autosave_isolation_also_applies_to_engine_autosaves_and_preference_changes() {
+    let dir = autosave_test_dir("engine-save");
+    let desktop = dir.join("DesktopCustom");
+    std::fs::create_dir_all(&desktop).unwrap();
+    std::fs::write(desktop.join("Untitled Project auto-save 1.ecproj"), "desktop backup").unwrap();
+    let mut session = Session::default();
+    session.prefs.auto_save.location = "custom".into();
+    session.prefs.auto_save.folder = desktop.to_string_lossy().into_owned();
+    let mut s = McpServer::new(Backend::headless(session)).with_autosave(&dir).unwrap();
+    call_json(&mut s, "execute_command", json!({"command":"comp.new","params":{"name":"Isolated"}}));
+    let status = autosave_status(&mut s);
+    let explicit = call_json(&mut s, "execute_command", json!({"command":"file.autoSave"}));
+    assert!(std::path::Path::new(explicit["path"].as_str().unwrap()).starts_with(status["folder"].as_str().unwrap()));
+    assert_eq!(autosave_status(&mut s)["latestPath"], explicit["path"]);
+    // The host override survives preference edits even within a single batch tool call.
+    call_json(
+        &mut s,
+        "batch",
+        json!({"steps":[
+            {"command":"prefs.set","params":{"values":{"autoSave.location":"custom","autoSave.folder":desktop.to_string_lossy()}}},
+            {"command":"file.autoSave","params":{}}
+        ]}),
+    );
+    call_json(&mut s, "save_project", json!({"path":dir.join("Named.ecproj")}));
+    call_json(&mut s, "execute_command", json!({"command":"layer.newText","params":{"text":"Latest isolated edit"}}));
+    let current = autosave_status(&mut s);
+    assert!(std::path::Path::new(current["latestPath"].as_str().unwrap()).starts_with(status["folder"].as_str().unwrap()));
+    assert!(std::fs::read_to_string(current["latestPath"].as_str().unwrap()).unwrap().contains("Latest isolated edit"));
+    let recovery = call_json(&mut s, "execute_command", json!({"command":"file.recoveryInfo"}));
+    assert_eq!(recovery["folder"], status["folder"]);
+    assert_eq!(std::fs::read_to_string(desktop.join("Untitled Project auto-save 1.ecproj")).unwrap(), "desktop backup");
+    assert_eq!(std::fs::read_dir(&desktop).unwrap().count(), 2, "only the original desktop file and the MCP subfolder");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn autosave_non_utf8_path_returns_an_error_instead_of_panicking() {
+    use std::os::unix::ffi::OsStringExt;
+    let root = std::path::PathBuf::from(std::ffi::OsString::from_vec(b"/tmp/ec-mcp-\xff".to_vec()));
+    let result = server().with_autosave(&root);
+    assert!(matches!(result, Err(crate::Error::Other(message)) if message.contains("UTF-8")));
+}
+
+#[test]
+fn core_tools_annotations_and_strict_keys() {
+    let mut s = server();
+    let tools = rpc(&mut s, 1, "tools/list", json!({}));
+    let tools = tools["tools"].as_array().unwrap();
+    for name in ["command_list", "command_run", "command_batch", "doc_inspect", "render_preview"] {
+        assert!(tools.iter().any(|t| t["name"] == name), "missing {name}");
+    }
+    for t in tools {
+        assert!(t["title"].as_str().is_some_and(|s| !s.is_empty()));
+        for hint in ["readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint"] {
+            assert!(t["annotations"][hint].is_boolean(), "{t}");
+        }
+        let msg = json!({"jsonrpc":"2.0", "id":2, "method":"tools/call", "params":{"name":t["name"], "arguments":{"typo_key":1}}});
+        let reply = s.handle(&msg).unwrap();
+        assert_eq!(reply["error"]["code"], -32602, "{reply}");
+        assert!(reply["error"]["message"].as_str().unwrap().contains("typo_key"));
+    }
+    let r = call_json(&mut s, "command_run", json!({"id":"comp.new", "params":{"width":32,"height":32}}));
+    assert!(r.is_object());
+    let (content, err) = call(&mut s, "command_batch", json!({"steps":[{"id":"no.such.command"},{"id":"layer.newNull"}]}));
+    assert!(err);
+    let result: Value = serde_json::from_str(content[0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(result["completed"], 0);
+    assert_eq!(result["failed"], 1);
+    assert_eq!(result["results"].as_array().unwrap().len(), 1);
+    let (content, err) = call(&mut s, "command_batch", json!({"stop_on_error":false,"steps":[{"id":"no.such.command"},{"id":"layer.newNull"}]}));
+    assert!(err);
+    let result: Value = serde_json::from_str(content[0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(result["completed"], 1);
+    assert_eq!(result["failed"], 1);
+    assert!(call_json(&mut s, "doc_inspect", json!({}))["activeComp"].is_object());
+    assert!(!call(&mut s, "render_preview", json!({"max_side":16})).1);
+}
+
+#[test]
+fn resources_match_tools_and_recover_after_parse_error() {
+    let mut s = server();
+    let bad: Value = serde_json::from_str(&s.handle_line("{broken").unwrap()).unwrap();
+    assert_eq!(bad["error"]["code"], -32700);
+    assert!(bad["id"].is_null());
+    assert_eq!(rpc(&mut s, 1, "ping", json!({})), json!({}));
+    let list = rpc(&mut s, 2, "resources/list", json!({}));
+    for (uri, tool) in [("effectcraft://document", "doc_inspect"), ("effectcraft://commands", "command_list")] {
+        assert!(list["resources"].as_array().unwrap().iter().any(|r| r["uri"] == uri));
+        let r = rpc(&mut s, 3, "resources/read", json!({"uri":uri}));
+        assert_eq!(r["contents"][0]["mimeType"], "application/json");
+        let value: Value = serde_json::from_str(r["contents"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(value, call_json(&mut s, tool, json!({})));
+    }
+}
+
+/// Rendering is a direct tool call, outside Session::execute's existing panic guard.
+#[test]
+fn render_panic_is_an_error_and_session_remains_usable() {
+    use effectcraft_engine::{
+        color::Label,
+        project::{Footage, FootageKind, ItemId, ItemKind},
+        raster::Image,
+        render::FootageSource,
+        time::Tick,
+    };
+    use std::sync::{Arc, Mutex};
+    struct BrokenFootage(Mutex<bool>);
+    impl FootageSource for BrokenFootage {
+        fn frame(&self, _: ItemId, _: &Footage, _: Tick) -> Option<Arc<Image>> {
+            let mut first = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if *first {
+                *first = false;
+                panic!("synthetic decoder failure");
+            }
+            Some(Arc::new(Image::new(16, 16)))
+        }
+    }
+    let mut session = Session { footage: Arc::new(BrokenFootage(Mutex::new(true))), ..Default::default() };
+    session.execute("comp.new", json!({"width":16,"height":16})).unwrap();
+    let item = Arc::make_mut(&mut session.project).add_item(
+        "synthetic",
+        Label::Aqua,
+        None,
+        ItemKind::Footage(Footage { path: "synthetic.png".into(), kind: FootageKind::Still, width: 16, height: 16, has_video: true, ..Default::default() }),
+    );
+    session.execute("layer.addItem", json!({"item":item.0})).unwrap();
+    let mut s = McpServer::new(Backend::headless(session));
+    let (content, err) = call(&mut s, "render_frame", json!({}));
+    assert!(err);
+    assert!(content[0]["text"].as_str().unwrap().contains("synthetic decoder failure"));
+    assert_eq!(rpc(&mut s, 2, "ping", json!({})), json!({}));
+    assert!(!call(&mut s, "render_frame", json!({})).1);
+}
+
+/// MCP 2026-07-28 ("modern") clients declare their revision per request in `_meta` and reject
+/// list/read results without `resultType`, `ttlMs` and `cacheScope`; legacy sessions (revision
+/// negotiated through `initialize`) keep the old result shape.
+#[test]
+fn modern_clients_get_result_type() {
+    let mut s = server();
+    let meta = json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientInfo": {"name": "t", "version": "1"},
+        "io.modelcontextprotocol/clientCapabilities": {},
+    });
+    for (id, method, params) in [
+        (1, "tools/list", json!({"_meta": meta})),
+        (2, "resources/list", json!({"_meta": meta})),
+        (3, "resources/templates/list", json!({"_meta": meta})),
+        (4, "resources/read", json!({"_meta": meta, "uri": "effectcraft://document"})),
+        (5, "tools/call", json!({"_meta": meta, "name": "command_list", "arguments": {}})),
+    ] {
+        let r = rpc(&mut s, id, method, params);
+        assert_eq!(r["resultType"], "complete", "{method}: {r}");
+        if method != "tools/call" {
+            assert!(r["ttlMs"].is_u64(), "{method}: {r}");
+            assert!(matches!(r["cacheScope"].as_str(), Some("public" | "private")), "{method}: {r}");
+        }
+    }
+    let mut s = server();
+    rpc(&mut s, 1, "initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}}));
+    for (id, method, params) in
+        [(2, "tools/list", json!({})), (3, "resources/list", json!({})), (4, "resources/read", json!({"uri": "effectcraft://document"}))]
+    {
+        let r = rpc(&mut s, id, method, params);
+        let res = r.as_object().unwrap();
+        assert!(!res.contains_key("resultType") && !res.contains_key("ttlMs") && !res.contains_key("cacheScope"), "{method}: {r}");
+    }
+}
+
+#[test]
+fn render_job_state_recovers_a_poisoned_lock() {
+    let shared = std::sync::Arc::new(effectcraft_engine::render_queue::JobShared::default());
+    let worker = shared.clone();
+    let _ = std::thread::spawn(move || {
+        let mut state = worker.state.lock().unwrap();
+        state.done = 3;
+        panic!("synthetic worker panic while holding the progress lock");
+    })
+    .join();
+    assert_eq!(shared.snapshot().done, 3);
+}
+
+/// A render that takes ~2 ms per frame and writes its file first (so a cancel leaves a partial
+/// one to clean up).
+struct SlowExporter;
+
+impl effectcraft_engine::Exporter for SlowExporter {
+    fn formats(&self) -> Vec<effectcraft_engine::project::render_queue::OutputFormat> {
+        effectcraft_engine::project::render_queue::OutputFormat::ALL.to_vec()
+    }
+    fn export(&self, job: &effectcraft_engine::ExportJob, progress: &mut dyn FnMut(u64, u64) -> bool) -> Result<effectcraft_engine::ExportResult, String> {
+        std::fs::write(job.path, b"partial").map_err(|e| e.to_string())?;
+        let n = 2000;
+        for k in 0..=n {
+            if !progress(k, n) {
+                std::fs::remove_file(job.path).map_err(|e| e.to_string())?;
+                return Err(effectcraft_engine::render_queue::CANCELLED.into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        Ok(effectcraft_engine::ExportResult { path: job.path.to_string(), frames: n, ..Default::default() })
+    }
+}
+
+/// docs/mcp.md "Requests during a render": while a blocking render runs, every way of starting a
+/// second render is refused (blocking, `wait: false`, inside a batch), and edits are applied to
+/// the project without changing the running job, which renders the snapshot it started with.
+#[test]
+fn second_render_is_refused_and_edits_apply_during_a_render() {
+    let dir = std::env::temp_dir().join(format!("effectcraft-mcp-busy-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (in_r, mut in_w) = std::io::pipe().unwrap();
+    let (out_r, out_w) = std::io::pipe().unwrap();
+    let server = std::thread::spawn(move || {
+        let session = Session { exporter: Some(std::sync::Arc::new(SlowExporter)), ..Default::default() };
+        McpServer::new(Backend::headless(session)).serve(BufReader::new(in_r), out_w).unwrap();
+    });
+    let mut lines = BufReader::new(out_r).lines();
+    let mut next = || -> Value { serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap() };
+    let mut send = |v: Value| writeln!(in_w, "{v}").unwrap();
+    let call =
+        |id: u64, name: &str, arguments: Value| json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": name, "arguments": arguments}});
+    send(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}}));
+    next();
+    send(call(2, "command_run", json!({"id": "comp.new", "params": {"width": 64, "height": 64, "duration": 1}})));
+    assert_eq!(next()["result"]["isError"], false);
+    let a = dir.join("a.mp4").to_string_lossy().to_string();
+    send(call(3, "command_run", json!({"id": "renderQueue.add", "params": {"output": a}})));
+    assert_eq!(next()["result"]["isError"], false);
+    send(call(4, "command_run", json!({"id": "renderQueue.render"})));
+    send(call(5, "command_run", json!({"id": "renderQueue.render", "params": {"wait": false}})));
+    send(call(6, "command_run", json!({"id": "renderQueue.render"})));
+    send(call(7, "command_batch", json!({"steps": [{"id": "renderQueue.render", "params": {"wait": false}}]})));
+    send(call(8, "command_run", json!({"id": "comp.new", "params": {"name": "Added while rendering", "width": 32, "height": 32, "duration": 1}})));
+    let mut replies = std::collections::HashMap::new();
+    while !replies.contains_key(&4) {
+        let m = next();
+        replies.insert(m["id"].as_u64().unwrap(), m);
+    }
+    for id in [5, 6, 7] {
+        let m = &replies[&id];
+        assert_eq!(m["result"]["isError"], true, "a second render is refused: {m}");
+        let text = m["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("already in progress") || text.contains("is rendering"), "{m}");
+    }
+    assert_eq!(replies[&8]["result"]["isError"], false, "edits are applied during a render");
+    let done = &replies[&4];
+    assert_eq!(done["result"]["isError"], false, "{done}");
+    let v: Value = serde_json::from_str(done["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(v["items"].as_array().unwrap().len(), 1, "{v}");
+    assert_eq!(v["items"][0]["statusLabel"], "Done", "{v}");
+    send(call(9, "doc_inspect", json!({})));
+    let doc = next();
+    assert!(doc.to_string().contains("Added while rendering"), "{doc}");
+    drop(in_w);
+    server.join().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// docs/mcp.md "Progress and cancellation" over the stdio loop: a blocking `renderQueue.render`
+/// reports `notifications/progress` for its token, other requests are answered while it renders,
+/// and `notifications/cancelled` stops it, deletes the partial file and sends no response.
+#[test]
+fn render_progress_and_cancel() {
+    let dir = std::env::temp_dir().join(format!("effectcraft-mcp-progress-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (in_r, mut in_w) = std::io::pipe().unwrap();
+    let (out_r, out_w) = std::io::pipe().unwrap();
+    let server = std::thread::spawn(move || {
+        let session = Session { exporter: Some(std::sync::Arc::new(SlowExporter)), ..Default::default() };
+        McpServer::new(Backend::headless(session)).serve(BufReader::new(in_r), out_w).unwrap();
+    });
+    let mut lines = BufReader::new(out_r).lines();
+    let mut next = || -> Value { serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap() };
+    let mut send = |v: Value| writeln!(in_w, "{v}").unwrap();
+    let run = |id: u64, cmd: &str, params: Value, token: Option<Value>| {
+        let mut p = json!({"name": "command_run", "arguments": {"id": cmd, "params": params}});
+        if let Some(t) = token {
+            p["_meta"] = json!({"progressToken": t, "io.modelcontextprotocol/protocolVersion":"2026-07-28"});
+        }
+        json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": p})
+    };
+    send(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}}));
+    next();
+    send(run(2, "comp.new", json!({"width": 64, "height": 64, "duration": 1}), None));
+    assert_eq!(next()["result"]["isError"], false);
+    let a = dir.join("a.mp4").to_string_lossy().to_string();
+    send(run(3, "renderQueue.add", json!({"output": a}), None));
+    assert_eq!(next()["result"]["isError"], false);
+    // progress for the token, strictly increasing; doc_inspect answered while rendering
+    send(run(4, "renderQueue.render", json!({}), Some(json!("tok"))));
+    let (mut last, mut notes, mut asked, mut answered) = (-1.0, 0, false, false);
+    let done = loop {
+        let m = next();
+        if m["method"] == "notifications/progress" {
+            assert_eq!(m["params"]["progressToken"], "tok", "{m}");
+            let p = m["params"]["progress"].as_f64().unwrap();
+            assert!(p > last && p <= m["params"]["total"].as_f64().unwrap(), "{m}");
+            (last, notes) = (p, notes + 1);
+            if !asked && p > 0.0 {
+                asked = true;
+                send(json!({"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "doc_inspect", "arguments": {}}}));
+            }
+        } else if m["id"] == 5 {
+            answered = true;
+            assert_eq!(m["result"]["isError"], false, "{m}");
+        } else {
+            assert_eq!(m["id"], 4, "{m}");
+            break m;
+        }
+    };
+    assert_eq!(done["result"]["isError"], false, "{done}");
+    assert_eq!(done["result"]["resultType"], "complete");
+    assert_eq!(last, 1.0, "final progress reaches the total");
+    let v: Value = serde_json::from_str(done["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(v["items"][0]["statusLabel"], "Done", "{v}");
+    assert!(notes >= 2 && answered, "{notes} notifications; doc_inspect answered during the render: {answered}");
+    // cancel after the first notification: no response, the partial file is gone
+    let b = dir.join("b.mp4");
+    send(run(6, "renderQueue.add", json!({"output": b.to_string_lossy()}), None));
+    assert_eq!(next()["result"]["isError"], false);
+    send(run(7, "renderQueue.render", json!({}), Some(json!(7))));
+    loop {
+        let m = next();
+        assert_ne!(m["id"], 7, "{m}");
+        if m["method"] == "notifications/progress" && m["params"]["progress"].as_f64().unwrap() > 0.0 {
+            break;
+        }
+    }
+    assert!(b.exists(), "the render started writing");
+    send(json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 7, "reason": "test"}}));
+    send(json!({"jsonrpc": "2.0", "id": 8, "method": "ping"}));
+    let m = loop {
+        let m = next();
+        if m["method"] != "notifications/progress" {
+            break m;
+        }
+    };
+    assert_eq!(m["id"], 8, "no response for the cancelled request: {m}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let v = loop {
+        send(run(9, "renderQueue.list", json!({}), None));
+        let v: Value = serde_json::from_str(next()["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        // the queue stops rendering a moment before the stopped item's status is updated
+        if v["rendering"] == false && v["items"][1]["statusLabel"] != "Rendering" {
+            break v;
+        }
+        assert!(std::time::Instant::now() < deadline, "cancel did not stop the job: {v}");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    assert!(!b.exists(), "partial output deleted");
+    assert!(std::path::Path::new(&a).exists(), "completed earlier queue item is retained");
+    assert_eq!(v["items"][1]["statusLabel"], "User Stopped", "{v}");
+    drop(in_w);
+    server.join().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn render_without_token_finishes_after_stdin_closes() {
+    let dir = std::env::temp_dir().join(format!("ec-mcp-eof-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("complete.mp4");
+    let mut s = McpServer::new(Backend::headless(Session { exporter: Some(std::sync::Arc::new(SlowExporter)), ..Default::default() }));
+    let mut input = String::new();
+    for (id, command, params) in
+        [(1, "comp.new", json!({"width":16,"height":16})), (2, "renderQueue.add", json!({"output":path})), (3, "renderQueue.render", json!({}))]
+    {
+        input.push_str(&format!(
+            "{}\n",
+            json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"command_run","arguments":{"id":command,"params":params}}})
+        ));
+    }
+    let mut out = Vec::new();
+    s.serve(std::io::Cursor::new(input), &mut out).unwrap();
+    let replies: Vec<Value> = String::from_utf8(out).unwrap().lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+    assert_eq!(replies.len(), 3, "no token means no notifications: {replies:?}");
+    assert_eq!(replies[2]["result"]["isError"], false);
+    assert!(path.exists());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn panicked_render_worker_finishes_with_an_error() {
+    struct BrokenExporter;
+    impl effectcraft_engine::Exporter for BrokenExporter {
+        fn formats(&self) -> Vec<effectcraft_engine::project::render_queue::OutputFormat> {
+            effectcraft_engine::project::render_queue::OutputFormat::ALL.to_vec()
+        }
+        fn export(&self, _: &effectcraft_engine::ExportJob, _: &mut dyn FnMut(u64, u64) -> bool) -> Result<effectcraft_engine::ExportResult, String> {
+            panic!("synthetic exporter failure");
+        }
+    }
+    let mut session = Session { exporter: Some(std::sync::Arc::new(BrokenExporter)), ..Default::default() };
+    session.execute("comp.new", json!({"width":16,"height":16})).unwrap();
+    session.execute("renderQueue.add", json!({"output":"unused.mp4"})).unwrap();
+    session.execute("renderQueue.render", json!({"wait":false})).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while session.is_rendering() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(!session.is_rendering(), "a panicked worker must not leave an unfinishable job");
+    session.poll_render();
+    let queue = session.execute("renderQueue.list", json!({})).unwrap();
+    assert!(queue.to_string().contains("synthetic exporter failure"), "{queue}");
+    session.execute("renderQueue.add", json!({"output":"unused-again.mp4"})).unwrap();
+    let mut server = McpServer::new(Backend::headless(session));
+    let input =
+        json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"command_run","arguments":{"id":"renderQueue.render"}}}).to_string() + "\n";
+    let mut out = Vec::new();
+    server.serve(std::io::Cursor::new(input), &mut out).unwrap();
+    let reply: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(reply["result"]["isError"], true, "{reply}");
+}
+
+/// `id` is an accepted alias of `command` (#365 made unknown keys an error).
+#[test]
+fn command_tools_accept_id_as_an_alias() {
+    let mut s = server();
+    let d = call_json(&mut s, "describe_command", json!({"id": "comp.new"}));
+    assert_eq!(d["id"], "comp.new", "{d}");
+    call_json(&mut s, "execute_command", json!({"id": "comp.new", "params": {"name": "Alias", "width": 64, "height": 36}}));
+    let (_, err) = call(&mut s, "execute_command", json!({}));
+    assert!(err, "neither key is an error");
+}
+
+/// #500: `--automation-read-root` / `--automation-write-root` confine the files an agent reads
+/// and writes: inside the roots works, outside (or relative, `..`, through a symbolic link, by
+/// a batch step, by Save to the project's own file, from a script) is refused.
+#[test]
+fn automation_roots_confine_file_access() {
+    use crate::confine::Confinement;
+    let base = std::env::temp_dir().join(format!("ec-mcp-confine-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let (read, write, outside) = (base.join("in"), base.join("out"), base.join("elsewhere"));
+    for d in [&read, &write, &outside] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let p = |d: &std::path::Path, f: &str| d.join(f).to_string_lossy().into_owned();
+    // Unconfined (the default): anywhere.
+    let mut s = server();
+    call_json(&mut s, "execute_command", json!({"command": "comp.new", "params": {"name": "A", "width": 64, "height": 64}}));
+    call_json(&mut s, "save_project", json!({"path": p(&outside, "free.ecproj")}));
+    call_json(&mut s, "save_project", json!({"path": p(&read, "source.ecproj")}));
+
+    let mut s = server();
+    s.backend().confine(Confinement::new(std::slice::from_ref(&read), std::slice::from_ref(&write)).unwrap());
+    let denied = |s: &mut McpServer, name: &str, args: Value| {
+        let (c, err) = call(s, name, args.clone());
+        assert!(err, "{name} {args} should be refused: {c:?}");
+        c[0]["text"].as_str().unwrap_or_default().to_string()
+    };
+    // #2479: an unsaved project's queue item without `output` would write to the home folder.
+    call_json(&mut s, "execute_command", json!({"command": "comp.new", "params": {"name": "Unsaved", "width": 64, "height": 64}}));
+    let msg = denied(&mut s, "execute_command", json!({"command": "renderQueue.add", "params": {"comp": "Unsaved"}}));
+    assert!(msg.contains("home folder") && msg.contains("give `output`"), "{msg}");
+    call_json(&mut s, "execute_command", json!({"command": "renderQueue.add", "params": {"comp": "Unsaved", "output": p(&write, "unsaved.mp4")}}));
+    call_json(&mut s, "execute_command", json!({"command": "renderQueue.remove"}));
+    // Reading: inside a read root, not outside.
+    call_json(&mut s, "open_project", json!({"path": p(&read, "source.ecproj")}));
+    let msg = denied(&mut s, "open_project", json!({"path": p(&outside, "free.ecproj")}));
+    assert!(msg.contains("outside the automation roots"), "{msg}");
+    // Writing: inside a write root only; not into a read root, not relative, not with `..`.
+    call_json(&mut s, "save_project", json!({"path": p(&write, "saved.ecproj")}));
+    assert!(write.join("saved.ecproj").is_file());
+    denied(&mut s, "save_project", json!({"path": p(&read, "copy.ecproj")}));
+    denied(&mut s, "save_project", json!({"path": "relative.ecproj"}));
+    denied(&mut s, "save_project", json!({"path": p(&write, "../elsewhere/up.ecproj")}));
+    denied(&mut s, "execute_command", json!({"command": "comp.saveFrameAs", "params": {"path": p(&outside, "f.png")}}));
+    // Any other absolute path a command is given.
+    denied(&mut s, "execute_command", json!({"command": "renderQueue.add", "params": {"output": p(&outside, "movie.mp4")}}));
+    // A batch step.
+    let steps = json!([{"command": "comp.new", "params": {"name": "B"}}, {"command": "file.saveAs", "params": {"path": p(&outside, "b.ecproj")}}]);
+    denied(&mut s, "batch", json!({"steps": steps}));
+    let steps = json!([{"command": "file.saveAs", "params": {"path": "$1.path"}}]);
+    denied(&mut s, "batch", json!({"steps": steps}));
+    // Save (and Increment and Save) write the open project's own file: it must be writable.
+    call_json(&mut s, "open_project", json!({"path": p(&read, "source.ecproj")}));
+    denied(&mut s, "save_project", json!({}));
+    denied(&mut s, "execute_command", json!({"command": "file.incrementAndSave"}));
+    // Rendering the queue writes its items' outputs (by default beside the project).
+    call_json(&mut s, "execute_command", json!({"command": "renderQueue.add", "params": {"comp": "A"}}));
+    let queue = call_json(&mut s, "execute_command", json!({"command": "renderQueue.list"}));
+    assert!(queue["items"][0]["outputPath"].as_str().is_some_and(|o| o.starts_with(&*read.to_string_lossy())), "{queue}");
+    let msg = denied(&mut s, "execute_command", json!({"command": "renderQueue.render"}));
+    assert!(msg.contains("cannot write"), "{msg}");
+    call_json(&mut s, "open_project", json!({"path": p(&write, "saved.ecproj")}));
+    call_json(&mut s, "save_project", json!({}));
+    // Through a symbolic link out of a root.
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&outside, write.join("link")).unwrap();
+        denied(&mut s, "save_project", json!({"path": p(&write.join("link"), "escaped.ecproj")}));
+        assert!(!outside.join("escaped.ecproj").exists());
+    }
+    // Scripts can read and write anything: refused.
+    denied(&mut s, "run_script", json!({"code": "1 + 1"}));
+    denied(&mut s, "execute_command", json!({"command": "file.runScript", "params": {"path": p(&read, "x.jsx")}}));
+    // So can Plug-in Library jobs: they download modules, install code that loads at start-up and read `file://` catalogs.
+    for c in ["library.refresh", "library.install", "library.update", "library.uninstall", "library.loadInstalled", "library.preview"] {
+        let msg = denied(&mut s, "execute_command", json!({"command": c, "params": {"id": "x"}}));
+        assert!(msg.contains("not available while file access is confined"), "{msg}");
+    }
+    let steps = json!([{"command": "library.install", "params": {"id": "x"}}]);
+    denied(&mut s, "batch", json!({"steps": steps}));
+    call_json(&mut s, "execute_command", json!({"command": "library.list"}));
+    // Effect helpers are native programs: starting them or loading through them is refused too.
+    denied(&mut s, "execute_command", json!({"command": "effect.helpers.scan"}));
+    denied(&mut s, "execute_command", json!({"command": "effect.helpers.load", "params": {"path": p(&read, "x.ofx")}}));
+    for (id, params) in [
+        ("file.runStartupScripts", json!({})),
+        ("file.runShutdownScripts", json!({})),
+        // ScriptUI panels run their script when they open.
+        ("window.scriptPanel", json!({"name": "Layer Tools.jsx"})),
+        ("window.restoreScriptPanels", json!({})),
+    ] {
+        let msg = denied(&mut s, "execute_command", json!({"command": id, "params": params}));
+        assert!(msg.contains("not available while file access is confined"), "{id}: {msg}");
+        let msg = denied(&mut s, "batch", json!({"steps": [{"command": id, "params": params}]}));
+        assert!(msg.contains("not available while file access is confined"), "{id}: {msg}");
+    }
+    // Writes to the files the agent named: none outside.
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 1, "only the unconfined save");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// #2479: a queued output the agent didn't name is derived from where the project sits, so on a
+/// project that has never been saved it lands in the home folder, outside every automation root.
+/// Queueing it there is refused, rather than leaving an item that can never be rendered.
+#[test]
+fn automation_roots_refuse_a_queued_output_from_an_unsaved_project() {
+    use crate::confine::Confinement;
+    let base = std::env::temp_dir().join(format!("ec-mcp-default-out-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let write = base.join("out");
+    std::fs::create_dir_all(&write).unwrap();
+    let p = |f: &str| write.join(f).to_string_lossy().into_owned();
+    let mut s = server();
+    s.backend().confine(Confinement::new(&[], std::slice::from_ref(&write)).unwrap());
+    call_json(&mut s, "execute_command", json!({"command": "comp.new", "params": {"name": "A", "width": 64, "height": 64}}));
+    // Never saved: neither way of queueing a render may fall back to the home folder.
+    for command in ["renderQueue.add", "render.preRender", "file.createProxy"] {
+        let (c, err) = call(&mut s, "execute_command", json!({"command": command, "params": {"comp": "A"}}));
+        assert!(err, "`{command}` without an output should be refused: {c:?}");
+        let msg = c[0]["text"].as_str().unwrap_or_default();
+        assert!(msg.contains("the project has no file yet"), "`{command}`: {msg}");
+    }
+    // An array where a path goes: the engine reads a scalar, so this is no output either.
+    let (c, err) = call(&mut s, "execute_command", json!({"command": "file.createProxy", "params": {"comp": "A", "path": [p("arr.mov")]}}));
+    assert!(err, "an array where the output goes should be refused: {c:?}");
+    assert!(c[0]["text"].as_str().unwrap_or_default().contains("the project has no file yet"), "{c:?}");
+    // Naming an Output Module template instead of a file is the same: its own output is relative.
+    let (c, err) = call(&mut s, "execute_command", json!({"command": "render.preRender", "params": {"comp": "A", "output": "Lossless"}}));
+    assert!(err, "a template output should be refused too: {c:?}");
+    assert!(c[0]["text"].as_str().unwrap_or_default().contains("the project has no file yet"), "{c:?}");
+    let queue = call_json(&mut s, "execute_command", json!({"command": "renderQueue.list"}));
+    assert_eq!(queue["items"].as_array().map(Vec::len), Some(0), "nothing was queued: {queue}");
+    // Naming an output inside a write root is how it is done.
+    call_json(&mut s, "execute_command", json!({"command": "renderQueue.add", "params": {"comp": "A", "output": p("named.mp4")}}));
+    // A proxy named outside the roots is refused. Whether that reads as a write or a read is
+    // #1347's to classify, so this asserts the refusal and not its wording. The path is a sibling
+    // of the write root rather than `/elsewhere/…`, which is not absolute on Windows and would be
+    // refused for that instead.
+    let outside = base.join("elsewhere").join("proxy.mov").to_string_lossy().into_owned();
+    let (c, err) = call(&mut s, "execute_command", json!({"command": "file.createProxy", "params": {"comp": "A", "path": outside}}));
+    assert!(err, "a proxy outside the roots should be refused: {c:?}");
+    assert!(c[0]["text"].as_str().unwrap_or_default().contains("outside the automation roots"), "{c:?}");
+    // Once the project is saved there, the default output (beside it) is queued as before.
+    call_json(&mut s, "save_project", json!({"path": p("proj.ecproj")}));
+    // A name that is not a path is an Output Module template, and the output it resolves to lands
+    // beside the saved project: inside the write root, so it is allowed (#1347 relies on this).
+    call_json(&mut s, "execute_command", json!({"command": "file.createProxy", "params": {"comp": "A", "path": "ProxyTemplate"}}));
+    call_json(&mut s, "execute_command", json!({"command": "renderQueue.add", "params": {"comp": "A"}}));
+    let queue = call_json(&mut s, "execute_command", json!({"command": "renderQueue.list"}));
+    let out = queue["items"][1]["outputPath"].as_str().unwrap_or_default();
+    assert!(out.starts_with(&*write.to_string_lossy()), "{queue}");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// #2131 (audit F-11, "Running code"): `script.run` and the Scripts menu are refused while file
+/// access is confined, but a ScriptUI panel's script runs just as freely — when the panel opens,
+/// when an event reaches one of its controls, or when one of its tasks comes due — and
+/// `prefs.set` could grant every script run afterwards the file and network access the user
+/// withheld, in the settings file, long after the session. All of that is refused too.
+#[test]
+fn automation_roots_refuse_running_script_code() {
+    use crate::confine::Confinement;
+    let base = std::env::temp_dir().join(format!("ec-mcp-scripts-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let mut s = server();
+    s.backend().confine(Confinement::new(&[], std::slice::from_ref(&base)).unwrap());
+    let refused = |s: &mut McpServer, name: &str, args: Value| {
+        let (c, err) = call(s, name, args.clone());
+        assert!(err, "{name} {args} should be refused: {c:?}");
+        c[0]["text"].as_str().unwrap_or_default().to_string()
+    };
+    // Every way a script's code starts.
+    for (command, params) in [
+        ("window.scriptPanel", json!({"name": "Layer Tools.jsx"})),
+        ("window.restoreScriptPanels", json!({})),
+        ("script.runTasks", json!({})),
+        ("scriptui.click", json!({"window": 1, "widget": 2})),
+        ("scriptui.set", json!({"window": 1, "widget": 2, "value": 1})),
+        ("scriptui.mouse", json!({"window": 1, "widget": 2, "type": "click"})),
+        ("scriptui.close", json!({"window": 1})),
+    ] {
+        let msg = refused(&mut s, "execute_command", json!({"command": command, "params": params}));
+        assert!(msg.contains("not available while file access is confined"), "`{command}`: {msg}");
+    }
+    // Including as a batch step.
+    let msg = refused(&mut s, "batch", json!({"steps": [{"command": "window.scriptPanel", "params": {"name": "x.jsx"}}]}));
+    assert!(msg.contains("not available while file access is confined"), "{msg}");
+    // What scripts may do stays as the user left it, by either spelling of the setting.
+    for params in [
+        json!({"key": "scripting.allowScriptsWriteFiles", "value": true}),
+        json!({"key": "scripting.allow_scripts_write_files", "value": true}),
+        json!({"values": {"scripting.warnExecutingFiles": false}}),
+        json!({"values": {"general.showToolTips": false, "scripting.enableJsDebugger": true}}),
+        // `Prefs::set` makes a JSON pointer of the key, so this spelling resolves too…
+        json!({"key": "scripting/allowScriptsWriteFiles", "value": true}),
+        // …and the page on its own replaces every setting on it.
+        json!({"key": "scripting", "value": {"allowScriptsWriteFiles": true}}),
+        json!({"values": {"scripting": {"warnExecutingFiles": false}}}),
+    ] {
+        let msg = refused(&mut s, "execute_command", json!({"command": "prefs.set", "params": params}));
+        assert!(msg.contains("what a script may do"), "{msg}");
+    }
+    let got = call_json(&mut s, "execute_command", json!({"command": "prefs.get", "params": {"key": "scripting.allowScriptsWriteFiles"}}));
+    assert_eq!(got, json!(false), "{got}");
+    // Other settings, and looking at the script windows, still work.
+    call_json(&mut s, "execute_command", json!({"command": "prefs.set", "params": {"key": "general.showToolTips", "value": false}}));
+    call_json(&mut s, "execute_command", json!({"command": "scriptui.list"}));
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn blender_export_requires_an_absolute_path_in_a_write_root() {
+    use crate::confine::Confinement;
+    let base = std::env::temp_dir().join(format!("ec-blender-confine-{}", std::process::id()));
+    let (read, write) = (base.join("read"), base.join("write"));
+    for dir in [&read, &write] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let confinement = Confinement::new(std::slice::from_ref(&read), std::slice::from_ref(&write)).unwrap();
+    let check = |path: &std::path::Path| confinement.check_command("camera.exportBlender", &json!({"path": path}));
+    assert!(check(&write.join("scene.py")).unwrap().is_empty());
+    for path in [read.join("scene.py"), base.join("outside.py"), write.join("../read/scene.py")] {
+        assert!(check(&path).is_err(), "must deny {}", path.display());
+    }
+    for path in ["scene.py", "./scene.py", "write/scene.py", "../scene.py"] {
+        let error = check(std::path::Path::new(path)).unwrap_err().to_string();
+        assert!(error.contains("give an absolute path"), "{path}: {error}");
+    }
+    let read_only = Confinement::new(std::slice::from_ref(&write), &[]).unwrap();
+    assert!(read_only.check_command("camera.exportBlender", &json!({"path": write.join("scene.py")})).is_err());
+    for path in [json!(read.join("scene.py")), json!("scene.py"), json!("$1.path")] {
+        let batch = json!({"steps": [{"command": "camera.exportBlender", "params": {"path": path}}]});
+        assert!(confinement.check_command("engine.batch", &batch).is_err());
+    }
+    std::fs::remove_dir_all(&base).unwrap();
+}
+
+/// `render_frame` writes the frame to the `path` it is given, and never over a file the open
+/// project reads (#1743): footage, a proxy or the project file. The refusal comes before the
+/// frame is rendered, and the file is untouched.
+#[test]
+fn render_frame_never_writes_over_a_file_the_project_reads() {
+    use effectcraft_engine::{
+        color::Label,
+        project::{Footage, FootageKind, ItemKind},
+    };
+    use std::sync::Arc;
+    let dir = std::env::temp_dir().join(format!("effectcraft-mcp-overwrite-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (clip, project) = (dir.join("clip.png"), dir.join("Project.ecproj"));
+    std::fs::write(&clip, b"SOURCE FOOTAGE").unwrap();
+    let mut session = Session::default();
+    session.execute("comp.new", json!({"width": 16, "height": 16})).unwrap();
+    session.execute("file.saveAs", json!({"path": project.to_string_lossy()})).unwrap();
+    Arc::make_mut(&mut session.project).add_item(
+        "clip.png",
+        Label::Aqua,
+        None,
+        ItemKind::Footage(Footage {
+            path: clip.to_string_lossy().into_owned(),
+            kind: FootageKind::Still,
+            width: 16,
+            height: 16,
+            has_video: true,
+            ..Default::default()
+        }),
+    );
+    let saved = std::fs::read(&project).unwrap();
+    let mut s = McpServer::new(Backend::headless(session));
+    for (file, what) in [(&clip, "footage"), (&project, "project")] {
+        let (c, err) = call(&mut s, "render_frame", json!({"path": file.to_string_lossy(), "inline": false}));
+        let text = c[0]["text"].as_str().unwrap();
+        assert!(err && text.contains(&*file.to_string_lossy()) && text.contains(what), "{what}: {text}");
+    }
+    assert_eq!(std::fs::read(&clip).unwrap(), b"SOURCE FOOTAGE", "the footage is as it was");
+    assert_eq!(std::fs::read(&project).unwrap(), saved, "the project file is as it was");
+    // Anywhere else it writes the PNG.
+    let free = dir.join("frame.png");
+    let (c, err) = call(&mut s, "render_frame", json!({"path": free.to_string_lossy(), "inline": false}));
+    assert!(!err, "{c:?}");
+    assert_eq!(&std::fs::read(&free).unwrap()[..8], b"\x89PNG\r\n\x1a\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The same through the desktop app: the app knows the project's files, so the tool asks it
+/// (`file.checkOutput`) before it writes anything.
+#[test]
+fn bridged_render_frame_asks_the_app_before_it_writes() {
+    use effectcraft_engine::project::{Footage, FootageKind};
+    struct Probe;
+    impl effectcraft_engine::Importer for Probe {
+        fn probe(&self, path: &str) -> Result<Footage, String> {
+            Ok(Footage { path: path.to_string(), kind: FootageKind::Still, width: 4, height: 4, has_video: true, ..Default::default() })
+        }
+    }
+    let dir = std::env::temp_dir().join(format!("effectcraft-mcp-bridge-overwrite-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let clip = dir.join("clip.png");
+    std::fs::write(&clip, b"SOURCE FOOTAGE").unwrap();
+
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let (stream, _) = l.accept().unwrap();
+        let mut out = stream.try_clone().unwrap();
+        let mut session = Session { importer: Some(std::sync::Arc::new(Probe)), ..Default::default() };
+        for line in BufReader::new(stream).lines() {
+            let msg: Value = serde_json::from_str(&line.unwrap()).unwrap();
+            let p = &msg["params"];
+            let mut reply = match msg["method"].as_str().unwrap() {
+                "engine.execute" => match session.execute(p["command"].as_str().unwrap(), p["params"].clone()) {
+                    Ok(v) => json!({"ok": true, "result": v}),
+                    Err(e) => json!({"ok": false, "error": e.to_string()}),
+                },
+                "render.frame" if p["write"] == true && p["path"].is_string() => fake_render_frame(&session, p),
+                "render.frame" => json!({"ok": false, "error": "a frame save must be one app-owned write"}),
+                m => json!({"ok": false, "error": format!("unknown method `{m}`")}),
+            };
+            reply["id"] = msg["id"].clone();
+            writeln!(out, "{reply}").unwrap();
+        }
+    });
+    let mut s = McpServer::new(Backend::bridge(&port.to_string()).unwrap());
+    call_json(&mut s, "execute_command", json!({"command": "comp.new", "params": {"width": 16, "height": 16}}));
+    call_json(&mut s, "execute_command", json!({"command": "file.import", "params": {"paths": [clip.to_string_lossy()]}}));
+
+    let (c, err) = call(&mut s, "render_frame", json!({"path": clip.to_string_lossy(), "inline": false}));
+    let text = c[0]["text"].as_str().unwrap();
+    assert!(err && text.contains("clip.png") && text.contains("footage"), "{text}");
+    assert_eq!(std::fs::read(&clip).unwrap(), b"SOURCE FOOTAGE", "the footage is as it was");
+    // Anywhere else it writes the PNG.
+    let free = dir.join("frame.png");
+    let (c, err) = call(&mut s, "render_frame", json!({"path": free.to_string_lossy(), "inline": false}));
+    assert!(!err, "{c:?}");
+    assert_eq!(&std::fs::read(&free).unwrap()[..8], b"\x89PNG\r\n\x1a\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #2131 F-11 ("Indirect reads"): a project opened or imported from inside a read root names its
+/// footage, and those files are read when it renders. Footage outside the roots (an absolute
+/// path, `../`, a symbolic link to a file or a folder out of the root) must not reach the agent:
+/// its layer renders as missing footage, while footage inside the roots still renders.
+#[test]
+fn automation_roots_confine_the_footage_a_project_names() {
+    use crate::confine::Confinement;
+    let base = std::env::temp_dir().join(format!("ec-mcp-footage-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let (read, write, outside) = (base.join("in"), base.join("out"), base.join("elsewhere"));
+    for d in [&read, &write, &outside] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let red = image::RgbaImage::from_pixel(8, 8, image::Rgba([255, 0, 0, 255]));
+    red.save(outside.join("secret.png")).unwrap();
+    red.save(read.join("own.png")).unwrap();
+    let p = |d: &std::path::Path, f: &str| d.join(f).to_string_lossy().into_owned();
+    // A project in the read root showing `footage`, saved unconfined.
+    let project = |name: &str, footage: &str| {
+        let mut s = McpServer::new(Backend::headless(effectcraft_host::session()));
+        call_json(&mut s, "execute_command", json!({"command": "comp.new", "params": {"name": "C", "width": 8, "height": 8}}));
+        let imported = call_json(&mut s, "execute_command", json!({"command": "file.import", "params": {"paths": [footage]}}));
+        let item = imported["items"][0].as_u64().or_else(|| imported["item"].as_u64()).unwrap_or_else(|| panic!("{imported}"));
+        call_json(&mut s, "execute_command", json!({"command": "layer.addItem", "params": {"comp": "C", "item": item}}));
+        let path = p(&read, name);
+        call_json(&mut s, "save_project", json!({"path": path}));
+        path
+    };
+    // The middle pixel of comp C: red when the footage was read.
+    let shows_red = |s: &mut McpServer| {
+        let (c, err) = call(s, "render_frame", json!({"comp": "C"}));
+        assert!(!err, "{c:?}");
+        let png = base64::decode(c[0]["data"].as_str().unwrap()).unwrap();
+        let px = image::load_from_memory(&png).unwrap().to_rgba8().get_pixel(4, 4).0;
+        px[0] > 200 && px[3] > 200
+    };
+    let mut projects = vec![("absolute", project("absolute.ecproj", &p(&outside, "secret.png")))];
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(outside.join("secret.png"), read.join("link.png")).unwrap();
+        std::os::unix::fs::symlink(&outside, read.join("dir")).unwrap();
+        projects.push(("linked file", project("linked-file.ecproj", &p(&read, "link.png"))));
+        projects.push(("linked folder", project("linked-folder.ecproj", &p(&read.join("dir"), "secret.png"))));
+    }
+    // Relative to the project: `../elsewhere/secret.png`, written into a copy of a project.
+    let own = project("own.ecproj", &p(&read, "own.png"));
+    let text = std::fs::read_to_string(&own).unwrap();
+    assert!(text.contains(&p(&read, "own.png")) || text.contains("own.png"), "{text}");
+    let relative = text.replace(&p(&read, "own.png"), "../elsewhere/secret.png").replace("\"own.png\"", "\"../elsewhere/secret.png\"");
+    std::fs::write(read.join("relative.ecproj"), relative).unwrap();
+    projects.push(("relative", p(&read, "relative.ecproj")));
+
+    let confined = || {
+        let mut s = McpServer::new(Backend::headless(effectcraft_host::session()));
+        s.backend().confine(Confinement::new(std::slice::from_ref(&read), std::slice::from_ref(&write)).unwrap());
+        s
+    };
+    // Footage inside the read root renders.
+    let mut s = confined();
+    call_json(&mut s, "open_project", json!({"path": own}));
+    assert!(shows_red(&mut s), "footage inside the read root");
+    for (how, path) in &projects {
+        // Unconfined, the project shows the outside file.
+        let mut s = McpServer::new(Backend::headless(effectcraft_host::session()));
+        call_json(&mut s, "open_project", json!({"path": path}));
+        assert!(shows_red(&mut s), "{how}: unconfined shows the footage");
+        // Confined: opened, or imported into the open project.
+        let mut s = confined();
+        call_json(&mut s, "open_project", json!({"path": path}));
+        assert!(!shows_red(&mut s), "{how}: opened, the footage outside the roots was read");
+        let mut s = confined();
+        call_json(&mut s, "execute_command", json!({"command": "file.importProject", "params": {"path": path}}));
+        assert!(!shows_red(&mut s), "{how}: imported, the footage outside the roots was read");
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A symbolic link inside the read root, read once while it pointed inside, is checked again
+/// on every read: pointed outside afterwards, its footage must not come back once the frame
+/// cache is emptied.
+#[cfg(unix)]
+#[test]
+fn automation_roots_check_relinked_footage_again() {
+    use crate::confine::Confinement;
+    let base = std::env::temp_dir().join(format!("ec-mcp-relink-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let (read, write, outside) = (base.join("in"), base.join("out"), base.join("elsewhere"));
+    for d in [&read, &write, &outside] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    image::RgbaImage::from_pixel(8, 8, image::Rgba([0, 0, 255, 255])).save(read.join("own.png")).unwrap();
+    image::RgbaImage::from_pixel(8, 8, image::Rgba([255, 0, 0, 255])).save(outside.join("secret.png")).unwrap();
+    let link = read.join("link.png");
+    std::os::unix::fs::symlink(read.join("own.png"), &link).unwrap();
+    let link_path = link.to_string_lossy().into_owned();
+    let project = read.join("relink.ecproj").to_string_lossy().into_owned();
+    {
+        let mut s = McpServer::new(Backend::headless(effectcraft_host::session()));
+        call_json(&mut s, "execute_command", json!({"command": "comp.new", "params": {"name": "C", "width": 8, "height": 8}}));
+        let imported = call_json(&mut s, "execute_command", json!({"command": "file.import", "params": {"paths": [link_path]}}));
+        let item = imported["items"][0].as_u64().or_else(|| imported["item"].as_u64()).unwrap_or_else(|| panic!("{imported}"));
+        call_json(&mut s, "execute_command", json!({"command": "layer.addItem", "params": {"comp": "C", "item": item}}));
+        call_json(&mut s, "save_project", json!({"path": project}));
+    }
+    // The middle pixel of comp C.
+    let pixel = |s: &mut McpServer| {
+        let (c, err) = call(s, "render_frame", json!({"comp": "C"}));
+        assert!(!err, "{c:?}");
+        let png = base64::decode(c[0]["data"].as_str().unwrap()).unwrap();
+        image::load_from_memory(&png).unwrap().to_rgba8().get_pixel(4, 4).0
+    };
+    let mut s = McpServer::new(Backend::headless(effectcraft_host::session()));
+    s.backend().confine(Confinement::new(std::slice::from_ref(&read), std::slice::from_ref(&write)).unwrap());
+    call_json(&mut s, "open_project", json!({"path": project}));
+    let px = pixel(&mut s);
+    assert!(px[2] > 200 && px[0] < 50, "the link pointing inside renders: {px:?}");
+    std::fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(outside.join("secret.png"), &link).unwrap();
+    call_json(&mut s, "execute_command", json!({"command": "edit.purge", "params": {"what": "memory"}}));
+    let px = pixel(&mut s);
+    assert!(!(px[0] > 200 && px[3] > 200), "the link pointed outside afterwards was read: {px:?}");
+    let _ = std::fs::remove_dir_all(&base);
 }
