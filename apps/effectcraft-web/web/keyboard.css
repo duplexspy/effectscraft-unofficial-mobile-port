@@ -275,3 +275,571 @@
 .ec-kb-arrow {
   font-size: 12px;
 }
+
+/* Floating DPI Button */
+#ec-floating-dpi-btn {
+  position: fixed;
+  right: 18px;
+  bottom: 82px;
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  background: #343741;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4), 0 0 0 1px rgba(255, 255, 255, 0.15);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #ffffff;
+  font-size: 20px;
+  cursor: pointer;
+  z-index: 99990;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
+  transition: transform 0.15s ease, background 0.2s ease;
+}
+
+#ec-floating-dpi-btn:active {
+  transform: scale(0.92);
+  background: #23252b;
+}
+
+/* Floating Extensions Button */
+#ec-floating-ext-btn {
+  position: fixed;
+  right: 18px;
+  bottom: 140px;
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  background: #2b3342;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4), 0 0 0 1px rgba(255, 255, 255, 0.15);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #ffffff;
+  font-size: 20px;
+  cursor: pointer;
+  z-index: 99990;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
+  transition: transform 0.15s ease, background 0.2s ease;
+}
+
+#ec-floating-ext-btn:active {
+  transform: scale(0.92);
+  background: #1c222c;
+}
+
+/* DPI & Mobile Settings Modal */
+#ec-dpi-modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.7);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  z-index: 1000000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.2s ease;
+  font-family: var(--kb-font);
+}
+
+#ec-dpi-modal-overlay.active {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.ec-dpi-modal-card {
+  background: #202228;
+  border: 1px solid #3d414e;
+  border-radius: 12px;
+  width: 100%;
+  max-width: 460px;
+  box-shadow: 0 12px 36px rgba(0, 0, 0, 0.7);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  color: #e4e4e7;
+}
+
+.ec-dpi-modal-header {
+  padding: 12px 16px;
+  background: #18191f;
+  border-bottom: 1px solid #2e303a;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.ec-dpi-modal-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: #ffffff;
+}
+
+.ec-dpi-modal-close {
+  background: none;
+  border: none;
+  color: #8f929d;
+  font-size: 16px;
+  cursor: pointer;
+  padding: 4px;
+}
+
+.ec-dpi-modal-close:hover {
+  color: #ffffff;
+}
+
+.ec-dpi-modal-content {
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  max-height: 70vh;
+  overflow-y: auto;
+}
+
+.ec-dpi-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ec-dpi-label-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.ec-dpi-val-badge {
+  background: #2d8ceb;
+  color: #ffffff;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.ec-dpi-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 6px;
+  border-radius: 3px;
+  background: #373a46;
+  outline: none;
+}
+
+.ec-dpi-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: #2d8ceb;
+  cursor: pointer;
+  box-shadow: 0 0 6px rgba(0, 0, 0, 0.4);
+}
+
+.ec-dpi-presets {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.ec-dpi-preset-btn {
+  background: #2b2e38;
+  border: 1px solid #3c404f;
+  color: #cfd2dc;
+  padding: 6px 10px;
+  border-radius: 6px;
+  font-size: 11px;
+  cursor: pointer;
+  flex: 1;
+  text-align: center;
+  min-width: 60px;
+}
+
+.ec-dpi-preset-btn:active, .ec-dpi-preset-btn.active {
+  background: #2d8ceb;
+  color: #ffffff;
+  border-color: #55a6f8;
+}
+
+.ec-hardware-info {
+  background: #18191f;
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 11px;
+  color: #8f929d;
+  line-height: 1.5;
+}
+
+.ec-hardware-info strong {
+  color: #cfd2dc;
+}
+
+/* ========================================================= */
+/* Extension & Plug-in Manager Modal Styles */
+/* ========================================================= */
+#ec-ext-modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.75);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  z-index: 1000001;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 12px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.2s ease;
+  font-family: var(--kb-font);
+}
+
+#ec-ext-modal-overlay.active {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.ec-ext-modal-card {
+  background: #202228;
+  border: 1px solid #3d414e;
+  border-radius: 12px;
+  width: 100%;
+  max-width: 540px;
+  max-height: 85vh;
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.8);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  color: #e4e4e7;
+}
+
+.ec-ext-modal-header {
+  padding: 12px 16px;
+  background: #18191f;
+  border-bottom: 1px solid #2e303a;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.ec-ext-modal-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: #ffffff;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* Modal Tabs */
+.ec-ext-tabs {
+  display: flex;
+  background: #18191f;
+  border-bottom: 1px solid #2e303a;
+  padding: 0 12px;
+  gap: 4px;
+  overflow-x: auto;
+}
+
+.ec-ext-tab-btn {
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: #8f929d;
+  font-size: 12px;
+  font-weight: 500;
+  padding: 10px 12px;
+  cursor: pointer;
+  white-space: nowrap;
+  font-family: inherit;
+  transition: color 0.15s, border-color 0.15s;
+}
+
+.ec-ext-tab-btn:hover {
+  color: #cfd2dc;
+}
+
+.ec-ext-tab-btn.active {
+  color: #2d8ceb;
+  border-bottom-color: #2d8ceb;
+  font-weight: 600;
+}
+
+.ec-ext-tab-pane {
+  display: none;
+  padding: 16px;
+  flex: 1;
+  overflow-y: auto;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.ec-ext-tab-pane.active {
+  display: flex;
+}
+
+/* Extension Items List */
+.ec-ext-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ec-ext-item {
+  background: #272a33;
+  border: 1px solid #383c48;
+  border-radius: 8px;
+  padding: 10px 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.ec-ext-item-info {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  flex: 1;
+}
+
+.ec-ext-item-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: #ffffff;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ec-ext-item-badge {
+  font-size: 9px;
+  padding: 1px 6px;
+  border-radius: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.ec-badge-panel {
+  background: #2d8ceb26;
+  color: #55a6f8;
+  border: 1px solid #2d8ceb4d;
+}
+
+.ec-badge-script {
+  background: #20e07026;
+  color: #20e070;
+  border: 1px solid #20e0704d;
+}
+
+.ec-badge-plugin {
+  background: #e09f2026;
+  color: #ffb833;
+  border: 1px solid #e09f204d;
+}
+
+.ec-ext-item-folder {
+  font-size: 10px;
+  color: #8f929d;
+  font-family: monospace;
+}
+
+.ec-ext-item-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.ec-ext-action-btn {
+  background: #343845;
+  border: 1px solid #484e5e;
+  color: #cfd2dc;
+  border-radius: 4px;
+  padding: 4px 8px;
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.ec-ext-action-btn.primary {
+  background: #2d8ceb;
+  border-color: #55a6f8;
+  color: #ffffff;
+}
+
+.ec-ext-action-btn.danger {
+  background: #e0303026;
+  border-color: #e030304d;
+  color: #ff6b6b;
+}
+
+/* Upload Dropzone */
+.ec-upload-zone {
+  border: 2px dashed #3f4453;
+  border-radius: 10px;
+  padding: 24px 16px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  gap: 8px;
+  background: #252831;
+  cursor: pointer;
+  transition: border-color 0.15s, background-color 0.15s;
+}
+
+.ec-upload-zone:active, .ec-upload-zone.dragover {
+  border-color: #2d8ceb;
+  background: #29303e;
+}
+
+.ec-upload-icon {
+  font-size: 32px;
+}
+
+.ec-upload-text {
+  font-size: 13px;
+  font-weight: 600;
+  color: #ffffff;
+}
+
+.ec-upload-subtext {
+  font-size: 11px;
+  color: #8f929d;
+  max-width: 320px;
+}
+
+/* Auto placement info box */
+.ec-placement-banner {
+  background: #1c2331;
+  border: 1px solid #2d436b;
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: #9ab4db;
+}
+
+.ec-placement-banner strong {
+  color: #ffffff;
+}
+
+/* Creator Form */
+.ec-creator-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.ec-input-text {
+  background: #18191f;
+  border: 1px solid #373a46;
+  border-radius: 6px;
+  color: #ffffff;
+  padding: 8px 10px;
+  font-size: 12px;
+  outline: none;
+  font-family: inherit;
+}
+
+.ec-input-text:focus {
+  border-color: #2d8ceb;
+}
+
+.ec-code-area {
+  background: #14151a;
+  border: 1px solid #373a46;
+  border-radius: 6px;
+  color: #a6e22e;
+  padding: 10px;
+  font-size: 11px;
+  font-family: monospace, monospace;
+  min-height: 140px;
+  resize: vertical;
+  outline: none;
+  line-height: 1.35;
+}
+
+.ec-code-area:focus {
+  border-color: #2d8ceb;
+}
+
+/* Quick Preset Chips */
+.ec-preset-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.ec-chip {
+  background: #272a33;
+  border: 1px solid #383c48;
+  color: #adb0be;
+  padding: 4px 8px;
+  border-radius: 12px;
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.ec-chip:active {
+  background: #2d8ceb;
+  color: #ffffff;
+}
+
+/* Guide Content */
+.ec-guide-body {
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: #c4c7d2;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.ec-guide-body h4 {
+  margin: 0;
+  color: #ffffff;
+  font-size: 13px;
+  border-bottom: 1px solid #2e303a;
+  padding-bottom: 4px;
+}
+
+.ec-guide-code {
+  background: #14151a;
+  border: 1px solid #2a2d38;
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-family: monospace;
+  font-size: 10.5px;
+  color: #e6db74;
+  white-space: pre-wrap;
+  overflow-x: auto;
+}
+
+.ec-prompt-box {
+  background: #1b2636;
+  border: 1px solid #2b456e;
+  border-radius: 6px;
+  padding: 10px;
+  color: #a4cdff;
+  font-size: 11px;
+  line-height: 1.45;
+}
