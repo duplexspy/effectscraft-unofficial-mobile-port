@@ -2,18 +2,23 @@ package ai.storyteller.effectcraft;
 
 import android.annotation.SuppressLint;
 import android.app.Activity;
+import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.ActivityInfo;
 import android.content.res.Configuration;
 import android.graphics.Color;
+import android.media.MediaScannerConnection;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
 import android.os.PowerManager;
 import android.os.Process;
+import android.provider.MediaStore;
 import android.provider.Settings;
+import android.util.Base64;
 import android.util.Log;
 import android.view.View;
 import android.view.Window;
@@ -22,6 +27,7 @@ import android.view.inputmethod.InputMethodManager;
 import android.webkit.ConsoleMessage;
 import android.webkit.JavascriptInterface;
 import android.webkit.PermissionRequest;
+import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceResponse;
@@ -29,9 +35,13 @@ import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.FrameLayout;
+import android.widget.Toast;
 
+import java.io.File;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -40,11 +50,13 @@ public class MainActivity extends Activity {
     private static final String PREFS_NAME = "EffectCraftPrefs";
     private static final String PREF_MIN_WIDTH = "min_width";
     private static final String PREF_ZOOM = "ui_zoom";
+    private static final int REQUEST_FILE_CHOOSER = 1001;
 
     private WebView webView;
     private EffectCraftServer localServer;
     private int serverPort = 8765;
     private SharedPreferences prefs;
+    private ValueCallback<Uri[]> mUploadCallback;
 
     @SuppressLint("SetJavaScriptEnabled")
     @Override
@@ -90,6 +102,32 @@ public class MainActivity extends Activity {
             @Override
             public void onPermissionRequest(PermissionRequest request) {
                 request.grant(request.getResources());
+            }
+
+            @Override
+            public boolean onShowFileChooser(WebView webView, ValueCallback<Uri[]> filePathCallback, FileChooserParams fileChooserParams) {
+                if (mUploadCallback != null) {
+                    mUploadCallback.onReceiveValue(null);
+                    mUploadCallback = null;
+                }
+                mUploadCallback = filePathCallback;
+
+                Intent intent = new Intent(Intent.ACTION_GET_CONTENT);
+                intent.addCategory(Intent.CATEGORY_OPENABLE);
+                intent.setType("*/*");
+                intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+
+                try {
+                    startActivityForResult(Intent.createChooser(intent, "Import Media / Project"), REQUEST_FILE_CHOOSER);
+                    return true;
+                } catch (Exception e) {
+                    Log.e(TAG, "Cannot launch file chooser intent", e);
+                    if (mUploadCallback != null) {
+                        mUploadCallback.onReceiveValue(null);
+                        mUploadCallback = null;
+                    }
+                    return false;
+                }
             }
         });
 
@@ -255,7 +293,99 @@ public class MainActivity extends Activity {
         }
     }
 
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQUEST_FILE_CHOOSER) {
+            if (mUploadCallback == null) return;
+            Uri[] results = null;
+            if (resultCode == Activity.RESULT_OK && data != null) {
+                if (data.getClipData() != null) {
+                    int count = data.getClipData().getItemCount();
+                    results = new Uri[count];
+                    for (int i = 0; i < count; i++) {
+                        results[i] = data.getClipData().getItemAt(i).getUri();
+                    }
+                } else if (data.getData() != null) {
+                    results = new Uri[]{data.getData()};
+                }
+            }
+            mUploadCallback.onReceiveValue(results);
+            mUploadCallback = null;
+        }
+    }
+
     public class AndroidBridge {
+        @JavascriptInterface
+        public void saveToDownloads(String base64Data, String filename, String mimeType) {
+            if (base64Data == null || filename == null || filename.isEmpty()) return;
+            new Thread(() -> {
+                try {
+                    byte[] bytes = Base64.decode(base64Data, Base64.DEFAULT);
+                    String safeMime = (mimeType == null || mimeType.isEmpty()) ? "application/octet-stream" : mimeType;
+                    boolean success = false;
+                    String targetName = filename;
+
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        ContentValues values = new ContentValues();
+                        values.put(MediaStore.MediaColumns.DISPLAY_NAME, targetName);
+                        values.put(MediaStore.MediaColumns.MIME_TYPE, safeMime);
+                        values.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/EffectCraft");
+                        Uri uri = getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
+                        if (uri != null) {
+                            try (OutputStream os = getContentResolver().openOutputStream(uri)) {
+                                if (os != null) {
+                                    os.write(bytes);
+                                    os.flush();
+                                    success = true;
+                                }
+                            }
+                        }
+                    } else {
+                        File downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
+                        File effectCraftDir = new File(downloadsDir, "EffectCraft");
+                        if (!effectCraftDir.exists()) effectCraftDir.mkdirs();
+                        File outFile = new File(effectCraftDir, targetName);
+                        try (FileOutputStream fos = new FileOutputStream(outFile)) {
+                            fos.write(bytes);
+                            fos.flush();
+                            success = true;
+                        }
+                        MediaScannerConnection.scanFile(MainActivity.this, new String[]{outFile.getAbsolutePath()}, new String[]{safeMime}, null);
+                    }
+
+                    final boolean ok = success;
+                    final String displayFile = targetName;
+                    runOnUiThread(() -> {
+                        if (ok) {
+                            Toast.makeText(MainActivity.this, "Export saved: Downloads/EffectCraft/" + displayFile, Toast.LENGTH_LONG).show();
+                            Log.i(TAG, "Successfully exported file to Downloads/EffectCraft/" + displayFile);
+                        } else {
+                            Toast.makeText(MainActivity.this, "Failed to save export to Downloads", Toast.LENGTH_SHORT).show();
+                            Log.e(TAG, "Failed to write export to Downloads");
+                        }
+                    });
+                } catch (Exception e) {
+                    Log.e(TAG, "Error saving export to Downloads", e);
+                    runOnUiThread(() -> Toast.makeText(MainActivity.this, "Error saving export: " + e.getMessage(), Toast.LENGTH_SHORT).show());
+                }
+            }).start();
+        }
+
+        @JavascriptInterface
+        public void openMobileFileChooser() {
+            runOnUiThread(() -> {
+                Intent intent = new Intent(Intent.ACTION_GET_CONTENT);
+                intent.addCategory(Intent.CATEGORY_OPENABLE);
+                intent.setType("*/*");
+                intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+                try {
+                    startActivityForResult(Intent.createChooser(intent, "Import Media / Project"), REQUEST_FILE_CHOOSER);
+                } catch (Exception e) {
+                    Log.e(TAG, "Cannot launch mobile file chooser", e);
+                }
+            });
+        }
         @JavascriptInterface
         public void showSoftKeyboard() {
             runOnUiThread(() -> {
